@@ -1,0 +1,19 @@
+[Unit]
+SourcePath=/usr/bin/psi_daemon
+Description=PSI Daemon
+After=sysinit.target
+
+[Service]
+User=system
+Groups=system
+RemainAfterExit=no
+Restart=yes
+Nice=-20
+ExecStartPre=+/bin/chmod 0666 /proc/pressure/memory
+ExecStartPre=+/bin/chown system:system /proc/pressure/memory
+ExecStart=/usr/bin/psi_daemon
+CapabilityBoundingSet=CAP_SYS_RESOURCE CAP_BLOCK_SUSPEND
+AmbientCapabilities=CAP_SYS_RESOURCE CAP_BLOCK_SUSPEND
+
+[Install]
+WantedBy=multi-user.target
