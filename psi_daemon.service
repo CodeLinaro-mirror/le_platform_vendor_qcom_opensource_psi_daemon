@@ -1,0 +1,21 @@
+[Unit]
+SourcePath=/usr/bin/psi_daemon
+Description=PSI Daemon
+After=sysinit.target
+
+[Service]
+User=system
+Groups=system
+RemainAfterExit=yes
+Restart=yes
+Nice=-20
+ExecStartPre=+/bin/chmod 0664 /proc/pressure/memory
+ExecStartPre=+/bin/chown system:system /proc/pressure/memory
+ExecStartPre=+/bin/chmod 0222 /sys/devices/virtual/qti_virtio_mem/qti_virtio_mem/kernel_unplug
+ExecStartPre=+/bin/chown system:system /sys/devices/virtual/qti_virtio_mem/qti_virtio_mem/kernel_unplug
+ExecStart=/usr/bin/psi_daemon
+CapabilityBoundingSet=CAP_SYS_RESOURCE CAP_BLOCK_SUSPEND
+AmbientCapabilities=CAP_SYS_RESOURCE CAP_BLOCK_SUSPEND
+
+[Install]
+WantedBy=multi-user.target
