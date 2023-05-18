@@ -14,42 +14,69 @@
 #include <errno.h>
 #include <vector>
 #include <base/logging.h>
-
-#include "vmmem.h"
-#include "vmmem_wrapper.h"
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <linux/qti_virtio_mem.h>
+#include <cutils/memory.h>
 
 #define SIZE_1MB        0x00100000
 
 static char psi_daemon_name[] = "psi_daemon";
+static constexpr char kVirtioMemPath[] = "/dev/qti_virtio_mem";
 
 using namespace std;
 
-/* vmmem interface handle */
-static VmMem *vmmem;
-
-/* mem_buf fds returned by vmmem interface */
+/* mem_buf fds returned by virtio-mem driver */
 static vector<int> array_memfd;
+
+#if defined(QTI_VIRTIO_MEM_IOC_HINT_CREATE)
+int virtio_mem_plug_memory(int64_t size, const std::string& name)
+{
+    struct qti_virtio_mem_ioc_hint_create_arg arg = {};
+    int virtio_mem_fd, ret;
+
+    virtio_mem_fd = TEMP_FAILURE_RETRY(open(kVirtioMemPath, O_RDONLY | O_CLOEXEC));
+    if (virtio_mem_fd < 0) {
+        LOG(ERROR) << "Unable to open " << kVirtioMemPath << " : " << strerror(errno) << "\n";
+        return virtio_mem_fd;
+    }
+
+    arg.size = size;
+    strlcpy(arg.name, name.c_str(), sizeof(arg.name));
+
+    ret = ioctl(virtio_mem_fd, QTI_VIRTIO_MEM_IOC_HINT_CREATE, &arg);
+    if (ret) {
+        LOG(ERROR) << "MemorySizeHint() Failed.\n";
+        close(virtio_mem_fd);
+        return ret;
+    }
+
+    close(virtio_mem_fd);
+    return arg.fd;
+}
+#else
+int virtio_mem_plug_memory(int64_t size, const std::string& name)
+{
+    (void)size;
+    (void)name;
+
+    LOG(ERROR) << "MemorySizeHint() NOT SUPPORTED.\n";
+    return -ENOTTY;
+}
+#endif
 
 int memory_plug_request(uint64_t size) {
     int memfd;
 
-    vmmem = CreateVmMem();
-    if (!vmmem) {
-        LOG(ERROR) << "CreateVmMem failed";
-        return -1;
-    }
-
-    memfd = MemorySizeHint(vmmem, size * SIZE_1MB, psi_daemon_name);
+    memfd = virtio_mem_plug_memory(size * SIZE_1MB, psi_daemon_name);
     if (memfd < 0) {
         LOG(ERROR) << "failed to suggest memory size hint";
-        FreeVmMem(vmmem);
         return -1;
     }
 
     LOG(INFO) << "Memory of size "<< size <<" MB plugged-in successfully";
     array_memfd.push_back(memfd);
 
-    FreeVmMem(vmmem);
     return 0;
 }
 
