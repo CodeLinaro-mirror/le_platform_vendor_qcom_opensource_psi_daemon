@@ -23,9 +23,14 @@ PKG_CHECK_MODULES([LIBBASE], [libbase])
 AC_SUBST([LIBBASE_CFLAGS])
 AC_SUBST([LIBBASE_LIBS])
 
-PKG_CHECK_MODULES([LIBVMMEM], [libvmmem])
-AC_SUBST([LIBVMMEM_CFLAGS])
-AC_SUBST([LIBVMMEM_LIBS])
+PKG_CHECK_MODULES([LIBCUTILS], [libcutils])
+AC_SUBST([LIBCUTILS_CFLAGS])
+AC_SUBST([LIBCUTILS_LIBS])
+
+AC_ARG_WITH(sanitized-headers,
+	AS_HELP_STRING([--with-sanitized-headers=DIR],
+		[Specify the location of the sanitized Linux headers]),
+	[CPPFLAGS="$CPPFLAGS -I $withval"])
 
 AC_CONFIG_FILES([ \
     Makefile])

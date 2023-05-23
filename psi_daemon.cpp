@@ -83,7 +83,7 @@ static const char* const zone_names[ZONE_MAX] = {
 #define PSI_MEMORY_PATH "/proc/pressure/memory"
 
 /* memory plugin size defaults (in MBs)*/
-#define DEFAULT_PLUGIN_RESOLUTION_MB    (16)
+#define DEFAULT_PLUGIN_RESOLUTION_MB    (4)
 #define DEFAULT_MAX_MEMORY_PLUGIN_MB    (256)
 
 enum psi_stall_type {
@@ -159,6 +159,8 @@ std::atomic<bool> wait_in_progress(false);
 
 /* stall tracking window size, 50ms*/
 static int PSI_WINDOW_SIZE_US = (50 * US_PER_MS);
+
+#define TARGET_OOM_SCORE_ADJ    -1000
 
 #define LINE_MAX 250
 #define STRINGIFY(x) STRINGIFY_INTERNAL(x)
@@ -841,6 +843,26 @@ static void psi_mainloop(void) {
     }
 }
 
+void set_oom_score_adj_self(int adj)
+{
+    char path[LINE_MAX] = "/proc/self/oom_score_adj";
+    char val[LINE_MAX];
+    int fd;
+
+    snprintf(val, sizeof(val), "%d", adj);
+
+    fd = open(path, O_WRONLY);
+    if (fd < 0) {
+        LOG(ERROR) <<"Couldn't open " << path;
+        return;
+    }
+
+    if (write(fd, val, strlen(val)) < 0)
+        LOG(ERROR) << "Couldn't write to "<< path;
+
+    close(fd);
+}
+
 int main(void) {
 
     int i;
@@ -891,6 +913,8 @@ int main(void) {
         thresholds.append(str);
     }
     LOG(INFO) << "PSI init completed! Thresholds: " << thresholds;
+
+    set_oom_score_adj_self(TARGET_OOM_SCORE_ADJ);
 
     resolution = get_memory_plugin_resolution();
     max_plugged_memory = get_max_memory_plugin_allowed();
