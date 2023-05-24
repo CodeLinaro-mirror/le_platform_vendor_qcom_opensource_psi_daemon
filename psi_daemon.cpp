@@ -579,6 +579,16 @@ static void wait_until_pressure_decay(void)
  * downstream implementation of memory plugin and unplug request
  * are needed to support the functionality of psi_daemon.
  */
+
+int __weak memory_plug_init(void) {
+    LOG(ERROR) << "Memory plug request not supported";
+    return -ENOTTY;
+}
+
+void __weak memory_plug_deinit(void) {
+    LOG(ERROR) << "Memory plug request not supported";
+}
+
 int __weak memory_plug_request(uint64_t __unused size) {
     LOG(ERROR) << "Memory plug request not supported";
     return -ENOTTY;
@@ -879,6 +889,12 @@ int main(void) {
 
     readfile_buf_size = sys_page_size;
 
+    if (memory_plug_init()) {
+        LOG(ERROR) << "Memory plugin init failed";
+        return -EINVAL;
+    }
+
+
     /* Initialize PSI monitors */
     if (init_and_register_psi_events()) {
         LOG(ERROR) << "Registering to PSI events failed";
@@ -927,5 +943,6 @@ int main(void) {
     /* should not exit */
     LOG(ERROR) << "Exiting...";
 
+    memory_plug_deinit();
     return 0;
 }

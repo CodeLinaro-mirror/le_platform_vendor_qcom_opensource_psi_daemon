@@ -23,6 +23,7 @@
 
 static char psi_daemon_name[] = "psi_daemon";
 static constexpr char kVirtioMemPath[] = "/dev/qti_virtio_mem";
+static int virtio_mem_fd = -1;
 
 using namespace std;
 
@@ -33,13 +34,10 @@ static vector<int> array_memfd;
 int virtio_mem_plug_memory(int64_t size, const std::string& name)
 {
     struct qti_virtio_mem_ioc_hint_create_arg arg = {};
-    int virtio_mem_fd, ret;
+    int ret;
 
-    virtio_mem_fd = TEMP_FAILURE_RETRY(open(kVirtioMemPath, O_RDONLY | O_CLOEXEC));
-    if (virtio_mem_fd < 0) {
-        LOG(ERROR) << "Unable to open " << kVirtioMemPath << " : " << strerror(errno) << "\n";
-        return virtio_mem_fd;
-    }
+    if (virtio_mem_fd < 0)
+        return -ENOTTY;
 
     arg.size = size;
     strlcpy(arg.name, name.c_str(), sizeof(arg.name));
@@ -47,11 +45,9 @@ int virtio_mem_plug_memory(int64_t size, const std::string& name)
     ret = ioctl(virtio_mem_fd, QTI_VIRTIO_MEM_IOC_HINT_CREATE, &arg);
     if (ret) {
         LOG(ERROR) << "MemorySizeHint() Failed.\n";
-        close(virtio_mem_fd);
         return ret;
     }
 
-    close(virtio_mem_fd);
     return arg.fd;
 }
 #else
@@ -64,6 +60,22 @@ int virtio_mem_plug_memory(int64_t size, const std::string& name)
     return -ENOTTY;
 }
 #endif
+
+int memory_plug_init() {
+
+    virtio_mem_fd = TEMP_FAILURE_RETRY(open(kVirtioMemPath, O_RDONLY | O_CLOEXEC));
+    if (virtio_mem_fd < 0) {
+        LOG(ERROR) << "Unable to open " << kVirtioMemPath << " : " << strerror(errno) << "\n";
+        return errno;
+    }
+
+    return 0;
+}
+
+void memory_plug_deinit() {
+    if (virtio_mem_fd >= 0)
+        close(virtio_mem_fd);
+}
 
 int memory_plug_request(uint64_t size) {
     int memfd;
