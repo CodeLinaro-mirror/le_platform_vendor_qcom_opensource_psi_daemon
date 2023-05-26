@@ -129,7 +129,7 @@ static ssize_t readfile_buf_size;
 static pthread_mutex_t fileread_buffer_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* in MBs */
-int64_t resolution, max_plugged_memory;
+uint64_t resolution, max_plugged_memory;
 
 /* num of memory chunks plugged-in, each of resolution MB size */
 std::atomic<uint64_t> mem_chunks_plugged{0};
@@ -168,6 +168,27 @@ static int PSI_WINDOW_SIZE_US = (50 * US_PER_MS);
 
 static char str_buf[LINE_MAX];
 
+int write_file(const char *file_path, char *s) {
+    int fd;
+    ssize_t len;
+
+    fd = TEMP_FAILURE_RETRY(open(file_path, O_WRONLY | O_CLOEXEC));
+    if (fd < 0) {
+        LOG(ERROR) << file_path << " open failed, err: " << strerror(errno);
+        return -EINVAL;
+    }
+
+    len = write(fd, s, strlen(s));
+    if (len < (ssize_t)strlen(s)) {
+        LOG(ERROR) << "error writing to file: " << file_path << "val " << s;
+        close(fd);
+        return -EINVAL;
+    }
+
+    close(fd);
+    return 0;
+}
+
 char *read_file(const char *file_path) {
     int fd;
     ssize_t readsize;
@@ -175,7 +196,7 @@ char *read_file(const char *file_path) {
 
     fd = TEMP_FAILURE_RETRY(open(file_path, O_RDONLY | O_CLOEXEC));
     if (fd < 0) {
-        LOG(ERROR) << file_path << " open failed, errno: " << strerror(errno);
+        LOG(ERROR) << file_path << " open failed, err: " << strerror(errno);
         return NULL;
     }
 
@@ -599,17 +620,28 @@ int __weak memory_unplug_request(uint64_t __unused size) {
     return -ENOTTY;
 }
 
+int __weak memory_unplug_request_kernel(size_t __unused count) {
+    LOG(ERROR) << "Memory unplug request kernel not supported";
+    return -ENOTTY;
+}
+
 int __weak memory_unplug_all_request(void) {
     LOG(ERROR) << "Memory unplug all request not supported";
     return -ENOTTY;
 }
 
-int64_t __weak get_memory_plugin_resolution(void) {
-    return DEFAULT_PLUGIN_RESOLUTION_MB;
+int __weak get_memory_plugin_resolution(uint64_t *plugin_resolution_mb) {
+    *plugin_resolution_mb = DEFAULT_PLUGIN_RESOLUTION_MB;
+    return 0;
 }
 
-int64_t __weak get_max_memory_plugin_allowed(void) {
-    return DEFAULT_MAX_MEMORY_PLUGIN_MB;
+int __weak get_max_memory_plugin_allowed(uint64_t *max_memory_plugin_mb) {
+    *max_memory_plugin_mb = DEFAULT_MAX_MEMORY_PLUGIN_MB;
+    return 0;
+}
+
+int __weak get_kernel_plugin_count(size_t __unused *count) {
+    return -ENOTTY;
 }
 
 void* memtrack_thread_function(void *arg) {
@@ -618,6 +650,7 @@ void* memtrack_thread_function(void *arg) {
     struct timespec timeout;
     uint64_t movable_free_kb = 0, normal_free_kb = 0, sys_memfree_kb = 0;
     uint64_t count = 0, mem_chunks_unplugged = 0;
+    uint64_t kernel_count = 0, kernel_chunks_plugged = 0;
     int res;
 
     while (1) {
@@ -674,7 +707,29 @@ startover:
                 mem_chunks_plugged.load() << " resolution " << resolution <<
                 " MB plugged_memory " << plugged_memory.load() << " MB";
 
+        /* first release blocks added by kernel */
+        if (get_kernel_plugin_count(&kernel_chunks_plugged) < 0) {
+            LOG(ERROR) << "failed to get kernel plugin count";
+            goto release_blocks;
+        }
+        LOG(INFO) << "kernel_chunks_plugged: " << kernel_chunks_plugged;
+
+        kernel_count = std::min(count, kernel_chunks_plugged);
+        memory_unplug_request_kernel(kernel_count);
+
+        /* get kernel plugin count after write */
+        if (get_kernel_plugin_count(&kernel_count) < 0) {
+            LOG(ERROR) << "failed to get kernel plugin count";
+            goto release_blocks;
+        }
+        LOG(INFO) << "kernel_count after write: " << kernel_count;
+
+        if (kernel_count <= kernel_chunks_plugged)
+            count -= (kernel_chunks_plugged - kernel_count);
+
+release_blocks:
         count = std::min(count, mem_chunks_plugged.load());
+        LOG(INFO) << "Count after kernel unplug: " << count;
 
         while(count-- > 0) {
             res = memory_unplug_request(resolution);
@@ -889,6 +944,13 @@ int main(void) {
 
     readfile_buf_size = sys_page_size;
 
+    /* allocate buffer for file reads */
+    readfile_buf = (char *)calloc(readfile_buf_size, sizeof(*readfile_buf));
+    if (!readfile_buf) {
+        LOG(ERROR) << "Buffer allocation for file reads failed";
+        return -ENOMEM;
+    }
+
     if (memory_plug_init()) {
         LOG(ERROR) << "Memory plugin init failed";
         return -EINVAL;
@@ -917,12 +979,6 @@ int main(void) {
 
     pthread_condattr_destroy(&thread_execution_cond_attr);
 
-    /* allocate buffer for file reads */
-    readfile_buf = (char *)calloc(readfile_buf_size, sizeof(*readfile_buf));
-    if (!readfile_buf) {
-        LOG(ERROR) << "Buffer allocation for file reads failed";
-        return -ENOMEM;
-    }
 
     for (i = 0; i < PRESSURE_EVT_COUNT; i++) {
         snprintf(str, sizeof(str), "%dMS ", psi_thresholds[i].threshold_ms);
@@ -932,8 +988,8 @@ int main(void) {
 
     set_oom_score_adj_self(TARGET_OOM_SCORE_ADJ);
 
-    resolution = get_memory_plugin_resolution();
-    max_plugged_memory = get_max_memory_plugin_allowed();
+     get_memory_plugin_resolution(&resolution);
+     get_max_memory_plugin_allowed(&max_plugged_memory);
     LOG(INFO) << "Memory plug-in resolution: " << resolution <<" MB";
     LOG(INFO) << "Maximum memory plug-in allowed: " << max_plugged_memory <<" MB";
 

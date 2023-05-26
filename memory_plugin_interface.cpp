@@ -25,6 +25,18 @@ static char psi_daemon_name[] = "psi_daemon";
 static constexpr char kVirtioMemPath[] = "/dev/qti_virtio_mem";
 static int virtio_mem_fd = -1;
 
+#define QVM_SYS_DEVICE_PATH         "/sys/devices/virtual/qti_virtio_mem/qti_virtio_mem"
+#define QVM_BLOCK_SIZE_PATH         QVM_SYS_DEVICE_PATH"/device_block_size"
+#define QVM_MAX_PLUGIN_THRES_PATH   QVM_SYS_DEVICE_PATH"/max_plugin_threshold"
+#define QVM_NUM_BLOCK_PLUGGED_PATH  QVM_SYS_DEVICE_PATH"/device_block_plugged"
+#define QVM_NUM_KERNEL_PLUGGED_PATH QVM_SYS_DEVICE_PATH"/kernel_plugged"
+#define QVM_NUM_KERNEL_UNPLUG_PATH  QVM_SYS_DEVICE_PATH"/kernel_unplug"
+
+char *read_file(const char *file_path);
+int write_file(const char *file_path, char *s);
+
+#define LINE_MAX 250
+
 using namespace std;
 
 /* mem_buf fds returned by virtio-mem driver */
@@ -108,23 +120,59 @@ int memory_unplug_request(uint64_t size) {
     return -ENOTTY;
 }
 
-//TODO: get these info after querying from qcom virtio-mem driver */
+int get_memory_plugin_resolution(uint64_t *plugin_resolution_mb) {
+    char *buf;
 
-/* memory plugin size defaults (in MBs)*/
-#define DEFAULT_PLUGIN_RESOLUTION_MB    (4)
-#define DEFAULT_MAX_MEMORY_PLUGIN_MB    (256)
+    buf = read_file(QVM_BLOCK_SIZE_PATH);
+    if (!buf)
+        return -EINVAL;
 
-int64_t get_memory_plugin_resolution(void) {
-    return DEFAULT_PLUGIN_RESOLUTION_MB;
+    *plugin_resolution_mb = strtoul(buf, 0, 10);
+    *plugin_resolution_mb /= SIZE_1MB;
+
+    return 0;
 }
 
-int64_t get_max_memory_plugin_allowed(void) {
-    return DEFAULT_MAX_MEMORY_PLUGIN_MB;
+int get_max_memory_plugin_allowed(uint64_t *max_memory_plugin_mb) {
+    char *buf;
+
+    buf = read_file(QVM_MAX_PLUGIN_THRES_PATH);
+    if (!buf)
+        return -EINVAL;
+
+    *max_memory_plugin_mb = strtoul(buf, 0, 10);
+    *max_memory_plugin_mb /= SIZE_1MB;
+
+    return 0;
+}
+
+int get_kernel_plugin_count(size_t *count) {
+    char *buf;
+
+    buf = read_file(QVM_NUM_KERNEL_PLUGGED_PATH);
+    if (!buf)
+        return -EINVAL;
+
+    *count = strtoul(buf, 0, 10);
+    return 0;
+}
+
+int memory_unplug_request_kernel(size_t count) {
+    char str_val[LINE_MAX];
+
+    snprintf(str_val, sizeof(str_val), "%lu", count);
+    if (write_file(QVM_NUM_KERNEL_UNPLUG_PATH, str_val)) {
+        LOG(ERROR) << "Failed to write to " << QVM_NUM_KERNEL_UNPLUG_PATH;
+        return -EINVAL;
+    }
+
+    get_kernel_plugin_count(&count);
+    LOG(INFO) << "Num kernel blocks plugin after write: " << count;
+    return 0;
 }
 
 int memory_unplug_all_request(void) {
     uint64_t initial_count, unplugged_count = 0, res;
-    uint64_t resolution = DEFAULT_PLUGIN_RESOLUTION_MB;
 
     initial_count = array_memfd.size();
     if (!initial_count) {
@@ -133,12 +181,11 @@ int memory_unplug_all_request(void) {
     }
 
     while (array_memfd.size()) {
-        LOG(INFO) << "releasing one memory chunk" << resolution <<" MB to host (PVM)";
+        LOG(INFO) << "releasing one memory chunk to host (PVM)";
         res = close(array_memfd.back());
         array_memfd.pop_back();
         if (res)
-            LOG(ERROR) << "Failed to unplug one memory chunk of size "<<
-                resolution <<" MB";
+            LOG(ERROR) << "Failed to unplug one memory chunk";
         else
             unplugged_count++;
     }
