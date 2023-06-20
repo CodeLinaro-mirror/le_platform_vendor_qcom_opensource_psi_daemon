@@ -83,7 +83,7 @@ static const char* const zone_names[ZONE_MAX] = {
 #define PSI_MEMORY_PATH "/proc/pressure/memory"
 
 /* memory plugin size defaults (in MBs)*/
-#define DEFAULT_PLUGIN_RESOLUTION_MB    (16)
+#define DEFAULT_PLUGIN_RESOLUTION_MB    (4)
 #define DEFAULT_MAX_MEMORY_PLUGIN_MB    (256)
 
 enum psi_stall_type {

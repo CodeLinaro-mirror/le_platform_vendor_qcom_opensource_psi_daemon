@@ -99,7 +99,7 @@ int memory_unplug_request(uint64_t size) {
 //TODO: get these info after querying from qcom virtio-mem driver */
 
 /* memory plugin size defaults (in MBs)*/
-#define DEFAULT_PLUGIN_RESOLUTION_MB    (16)
+#define DEFAULT_PLUGIN_RESOLUTION_MB    (4)
 #define DEFAULT_MAX_MEMORY_PLUGIN_MB    (256)
 
 int64_t get_memory_plugin_resolution(void) {
