@@ -82,9 +82,16 @@ static const char* const zone_names[ZONE_MAX] = {
 #define ZONEINFO_PATH   "/proc/zoneinfo"
 #define PSI_MEMORY_PATH "/proc/pressure/memory"
 
+#define WAKE_LOCK_PATH   "/sys/power/wake_lock"
+#define WAKE_UNLOCK_PATH "/sys/power/wake_unlock"
+#define WAKELOCK_STR     "psi_daemon_lock"
+#define WAKEUNLOCK_STR   WAKELOCK_STR
+
 /* memory plugin size defaults (in MBs)*/
 #define DEFAULT_PLUGIN_RESOLUTION_MB    (4)
 #define DEFAULT_MAX_MEMORY_PLUGIN_MB    (256)
+
+#define MAX_UNPLUG_RETRY                (2)
 
 enum psi_stall_type {
     PSI_SOME,
@@ -187,6 +194,7 @@ int write_file(const char *file_path, char *s) {
     ssize_t len;
 
     fd = TEMP_FAILURE_RETRY(open(file_path, O_WRONLY | O_CLOEXEC));
+
     if (fd < 0) {
         LOG(ERROR) << file_path << " open failed, err: " << strerror(errno);
         return -EINVAL;
@@ -247,6 +255,35 @@ static char *nextln(char *buf)
     if (!x)
         return buf + strlen(buf);
     return x + 1;
+}
+
+/* returns 0 on failure */
+static unsigned int wake_lock_acquire()
+{
+    char str_val[LINE_MAX];
+
+    snprintf(str_val, sizeof(str_val), WAKELOCK_STR);
+    if (write_file(WAKE_LOCK_PATH, str_val)) {
+        LOG(ERROR) << "Failed to write to " << WAKE_LOCK_PATH <<
+                " errno: " << strerror(errno);
+        return 0;
+    }
+
+    return 1;
+}
+
+static unsigned int wake_unlock()
+{
+    char str_val[LINE_MAX];
+
+    snprintf(str_val, sizeof(str_val), WAKEUNLOCK_STR);
+    if (write_file(WAKE_UNLOCK_PATH, str_val)) {
+        LOG(ERROR) << "Failed to write to " << WAKE_UNLOCK_PATH <<
+                " errno: " << strerror(errno);
+        return 0;
+    }
+
+    return 1;
 }
 
 static int parse_field(char *buf, const char *field_name, uint64_t *val) {
@@ -677,7 +714,8 @@ void* memtrack_thread_function(void *arg) {
     uint64_t count = 0, mem_chunks_unplugged = 0, total_free = 0;
     uint64_t kernel_count = 0, kernel_chunks_plugged = 0;
     struct memory_snapshot mem_snap;
-    int res;
+    int res, retry_count = 0;
+    unsigned int wake_locked = 0;
 
     while (1) {
 
@@ -686,6 +724,8 @@ void* memtrack_thread_function(void *arg) {
                 &thread_execution_mutex, NULL);
 
 startover:
+        if (!wake_locked && wake_lock_acquire())
+            wake_locked = 1;
         mem_chunks_unplugged = 0;
         clock_gettime(CLOCK_MONOTONIC, &timeout);
         timeout.tv_sec += IDLE_WAIT_TIME_S;
@@ -726,9 +766,12 @@ startover:
         if (system_memory_snapshot(&mem_snap))
             continue;
 
-        LOG(DEBUG) << "MemFree before UNPLUG: " << mem_snap.sys_memfree_kb <<
+        LOG(INFO) << "MemFree before UNPLUG: " << mem_snap.sys_memfree_kb <<
                 " KB (Normal: " << mem_snap.normal_free_kb << " KB, Movable: " <<
                 mem_snap.movable_free_kb << " KB)";
+
+        LOG(INFO) << "Movable inactive_file: " << mem_snap.movable_inactive_file_kb <<
+                        " KB : inactive_anon: " << mem_snap.movable_inactive_anon_kb << " KB";
 
         total_free = mem_snap.movable_free_kb;
 
@@ -794,10 +837,26 @@ release_blocks:
                 " KB (Normal: " << mem_snap.normal_free_kb << " KB, Movable: " <<
                 mem_snap.movable_free_kb<< " KB)";
 
-        if (!mem_chunks_plugged)
-            LOG(INFO) << "Unplugged all memory!!";
+        if (mem_chunks_plugged && retry_count < MAX_UNPLUG_RETRY) {
+            ++retry_count;
+            LOG(INFO) << "Retrying unplug after " << IDLE_WAIT_TIME_S <<
+                    " seconds (retry attempt: " << retry_count << ")";
+            goto startover;
+        }
+        else {
+            if (retry_count == MAX_UNPLUG_RETRY)
+                LOG(INFO) << "Max retry attempt reached for unplugging!!";
+            if (!mem_chunks_plugged)
+                LOG(INFO) << "Unplugged all memory!!";
+            retry_count = 0;
+        }
 
         //TODO: should we keep checking until all plugged memory is unplugged? goto startover ?
+
+        if(wake_locked && !wake_unlock())
+            LOG (ERROR) << "failed to wake unlock";
+        else
+            wake_locked = 0;
 
         /* now lets wait for notify again... */
 
@@ -924,7 +983,7 @@ static void psi_mainloop(void) {
             if (res < 0) {
                 LOG(ERROR) << "memory plugin request for " <<
                         resolution << "MB FAILED";
-                break;
+                continue;
             }
 
             plugged_memory += resolution;

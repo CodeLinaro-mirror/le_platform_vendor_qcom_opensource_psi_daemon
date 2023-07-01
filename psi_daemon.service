@@ -13,6 +13,7 @@ ExecStartPre=+/bin/chmod 0664 /proc/pressure/memory
 ExecStartPre=+/bin/chown system:system /proc/pressure/memory
 ExecStartPre=+/bin/chmod 0222 /sys/devices/virtual/qti_virtio_mem/qti_virtio_mem/kernel_unplug
 ExecStartPre=+/bin/chown system:system /sys/devices/virtual/qti_virtio_mem/qti_virtio_mem/kernel_unplug
+SupplementaryGroups=wakelock
 ExecStart=/usr/bin/psi_daemon
 CapabilityBoundingSet=CAP_SYS_RESOURCE CAP_BLOCK_SUSPEND
 AmbientCapabilities=CAP_SYS_RESOURCE CAP_BLOCK_SUSPEND
