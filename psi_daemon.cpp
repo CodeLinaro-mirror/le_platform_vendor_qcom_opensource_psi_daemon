@@ -14,7 +14,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <errno.h>
-#include <string.h>
+#include <sstream>
 #include <time.h>
 #include <sys/epoll.h>
 #include <sys/types.h>
@@ -100,6 +100,14 @@ static const char* stall_type_name[] = {
 struct psi_threshold {
     enum psi_stall_type stall_type;
     int threshold_ms;
+};
+
+struct memory_snapshot {
+    uint64_t sys_memfree_kb;
+    uint64_t normal_free_kb;
+    uint64_t movable_free_kb;
+    uint64_t movable_inactive_anon_kb;
+    uint64_t movable_inactive_file_kb;
 };
 
 struct psi_pressure {
@@ -236,8 +244,8 @@ static char *nextln(char *buf)
 }
 
 static int parse_field(char *buf, const char *field_name, uint64_t *val) {
-    char *save_ptr;
-    char *line;
+    std::istringstream sstr(buf);
+    std::string line;
     int nargs;
 
     if (field_name == NULL) {
@@ -245,12 +253,11 @@ static int parse_field(char *buf, const char *field_name, uint64_t *val) {
         goto err;
     }
 
-    for (line = strtok_r(buf, "\n", &save_ptr); line;
-        line = strtok_r(NULL, "\n", &save_ptr)) {
-        if(strstr(line, field_name) == NULL)
-          continue;
+    while (std::getline(sstr, line)) {
+        if(strstr(line.c_str(), field_name) == NULL)
+            continue;
         /* found our line */
-        nargs = sscanf(line, "%*[^0-9]%lu", val);
+        nargs = sscanf(line.c_str(), "%*[^0-9]%lu", val);
         if (nargs != 1) {
             LOG(ERROR) << "parsing field value " << field_name << " in line " <<
                     line << " failed";
@@ -264,15 +271,25 @@ err:
     return -EINVAL;
 }
 
-static int parse_system_zoneinfo(const char *zone_name, const char *field_name, uint64_t *val) {
-    char name[LINE_MAX + 1];    /* LINE_MAX + 1 to avoid sscanf overflow */
-    char *buf;
-    int nargs, field_val = -1;
+/* must be used with fileread_buffer_mutex lock taken */
+static char *get_zoneinfo(void)
+{
+    return read_file(ZONEINFO_PATH);
+}
 
-    pthread_mutex_lock(&fileread_buffer_mutex);
-    buf = read_file(ZONEINFO_PATH);
+static char *get_meminfo(void)
+{
+    return read_file(MEMINFO_PATH);
+}
+
+static int parse_zone_field(char *buf, const char *zone_name,
+        const char *field_name, uint64_t *val)
+{
+    char name[LINE_MAX + 1];    /* LINE_MAX + 1 to avoid sscanf overflow */
+    int nargs;
+
     if (!buf)
-        goto err;
+        return -EINVAL;
 
     while (*buf) {
         nargs = sscanf(buf, "Node %*u, zone %" STRINGIFY(LINE_MAX) "s", name);
@@ -282,57 +299,60 @@ static int parse_system_zoneinfo(const char *zone_name, const char *field_name, 
     }
 
     if (!*buf)
-        goto err;
+        return -EINVAL;
 
-    field_val = parse_field(buf, field_name, val);
-
-err:
-    pthread_mutex_unlock(&fileread_buffer_mutex);
-    return field_val;
+    return parse_field(buf, field_name, val);
 }
 
-static int parse_system_meminfo(const char *field_name, uint64_t *val) {
+static int system_memory_snapshot(struct memory_snapshot *mem_snap)
+{
     char *buf;
-    int field_val = -1;
+    int res = -1;
 
     pthread_mutex_lock(&fileread_buffer_mutex);
-    buf = read_file(MEMINFO_PATH);
+    buf = get_zoneinfo();
     if (!buf)
         goto err;
 
-    field_val = parse_field(buf, field_name, val);
+    /*
+     * some zone fields maynot be present if zone is empty.
+     * so not necessarily parsing errors. return 0 for fields
+     * that doesn't exists.
+     */
+
+    if (parse_zone_field(buf, zone_names[ZONE_NORMAL],
+            "pages free", &mem_snap->normal_free_kb))
+        mem_snap->normal_free_kb = 0;
+    mem_snap->normal_free_kb *= sys_page_size / SIZE_1KB;
+
+    if (parse_zone_field(buf, zone_names[ZONE_MOVABLE],
+            "pages free", &mem_snap->movable_free_kb))
+        mem_snap->movable_free_kb = 0;
+    mem_snap->movable_free_kb *= sys_page_size / SIZE_1KB;
+
+    if (parse_zone_field(buf, zone_names[ZONE_MOVABLE],
+            "nr_zone_inactive_anon", &mem_snap->movable_inactive_anon_kb))
+        mem_snap->movable_inactive_anon_kb = 0;
+    mem_snap->movable_inactive_anon_kb *= sys_page_size / SIZE_1KB;
+
+    if (parse_zone_field(buf, zone_names[ZONE_MOVABLE],
+            "nr_zone_inactive_file", &mem_snap->movable_inactive_file_kb))
+        mem_snap->movable_inactive_file_kb = 0;
+    mem_snap->movable_inactive_file_kb *= sys_page_size / SIZE_1KB;
+
+    buf = get_meminfo();
+    if (!buf)
+        goto err;
+
+    if(parse_field(buf, "MemFree", &mem_snap->sys_memfree_kb))
+        goto err;
+    res = 0;
 
 err:
+    if (res)
+        LOG(ERROR) << "failed to get memory snapshot";
     pthread_mutex_unlock(&fileread_buffer_mutex);
-    return field_val;
-}
-
-static uint64_t get_zone_memfree_kb(const char *name) {
-    uint64_t zone_memfree = 0;
-    int res;
-
-    res = parse_system_zoneinfo(name, "pages free", &zone_memfree);
-    if (res) {
-        LOG(ERROR) << "parsing system zoneinfo failed, errno: " <<
-                strerror(errno);
-        return 0;
-    }
-
-    return (((uint64_t)zone_memfree * sys_page_size) / SIZE_1KB);
-}
-
-static uint64_t get_system_memfree_kb() {
-    uint64_t system_memfree = 0;
-    int res;
-
-    res = parse_system_meminfo("MemFree", &system_memfree);
-    if (res) {
-        LOG(ERROR) << "parsing system meminfo failed, errno: " <<
-                strerror(errno);
-        return 0;
-    }
-
-    return system_memfree;
+    return res;
 }
 
 static int parse_system_psi_memory(struct psi_memory_pressure *psi_memory)
@@ -648,9 +668,9 @@ void* memtrack_thread_function(void *arg) {
 
     (void)(arg);
     struct timespec timeout;
-    uint64_t movable_free_kb = 0, normal_free_kb = 0, sys_memfree_kb = 0;
     uint64_t count = 0, mem_chunks_unplugged = 0;
     uint64_t kernel_count = 0, kernel_chunks_plugged = 0;
+    struct memory_snapshot mem_snap;
     int res;
 
     while (1) {
@@ -694,15 +714,17 @@ startover:
 
         /* didn't receive any new memory pressure events, so time to release memory to PVM */
         //TODO: add more checks for memory stats such as reclaimable memory, zram etc.
-        movable_free_kb = get_zone_memfree_kb(zone_names[ZONE_MOVABLE]);
-        normal_free_kb = get_zone_memfree_kb(zone_names[ZONE_NORMAL]);
-        sys_memfree_kb = get_system_memfree_kb();
 
-        LOG(DEBUG) << "MemFree before UNPLUG: " << sys_memfree_kb <<
-                " KB (Normal: " << normal_free_kb << " KB, Movable: " <<
-                movable_free_kb << " KB)";
+        /* take snapshot of memory */
+        if (system_memory_snapshot(&mem_snap))
+            continue;
 
-        count = (movable_free_kb / SIZE_1KB) / resolution;
+        LOG(DEBUG) << "MemFree before UNPLUG: " << mem_snap.sys_memfree_kb <<
+                " KB (Normal: " << mem_snap.normal_free_kb << " KB, Movable: " <<
+                mem_snap.movable_free_kb << " KB)";
+
+        count = (mem_snap.movable_free_kb / SIZE_1KB) / resolution;
+
         LOG(DEBUG) << "Count " << count << " mem_chunks_plugged " <<
                 mem_chunks_plugged.load() << " resolution " << resolution <<
                 " MB plugged_memory " << plugged_memory.load() << " MB";
@@ -748,13 +770,13 @@ release_blocks:
         plugged_memory -= (resolution * mem_chunks_unplugged);
         mem_chunks_plugged -= mem_chunks_unplugged;
 
-        normal_free_kb = get_zone_memfree_kb(zone_names[ZONE_NORMAL]);
-        movable_free_kb = get_zone_memfree_kb(zone_names[ZONE_MOVABLE]);
-        sys_memfree_kb = get_system_memfree_kb();
+        /* take memory snapshot after unplugging */
+        if (system_memory_snapshot(&mem_snap))
+            continue;
 
-        LOG(DEBUG) << "MemFree after UNPLUG: " << sys_memfree_kb <<
-                " KB (Normal: " << normal_free_kb << " KB, Movable: " <<
-                movable_free_kb<< " KB)";
+        LOG(DEBUG) << "MemFree after UNPLUG: " << mem_snap.sys_memfree_kb <<
+                " KB (Normal: " << mem_snap.normal_free_kb << " KB, Movable: " <<
+                mem_snap.movable_free_kb<< " KB)";
         //TODO: should we keep checking until all plugged memory is unplugged? goto startover ?
 
         /* now lets wait for notify again... */
@@ -825,8 +847,8 @@ static uint64_t get_timespec_delta_us(struct timespec start_tv, struct timespec 
 
 static void psi_mainloop(void) {
     pressure_levels pressure_level = PRESSURE_NONE;
-    uint64_t normal_free_kb = 0, movable_free_kb = 0, sys_memfree_kb = 0;
     struct timespec cur, start, end;
+    struct memory_snapshot mem_snap;
     int res;
 
     while (1) {
@@ -843,16 +865,16 @@ static void psi_mainloop(void) {
             continue;
         }
 
-        LOG(DEBUG) << "Received pressure event "<<
+        LOG(INFO) << "Received pressure event "<<
                 psi_level_to_string(pressure_level) <<
                 ". TIME: " << cur.tv_sec << "." << cur.tv_nsec/NS_PER_MS <<" s";
 
-        normal_free_kb = get_zone_memfree_kb(zone_names[ZONE_NORMAL]);
-        movable_free_kb = get_zone_memfree_kb(zone_names[ZONE_MOVABLE]);
-        sys_memfree_kb = get_system_memfree_kb();
-        LOG(DEBUG) << "MemFree: " << sys_memfree_kb <<
-                " KB (Normal: " << normal_free_kb << " KB, Movable: " <<
-                movable_free_kb << " KB)";
+        if (system_memory_snapshot(&mem_snap))
+            continue;
+
+        LOG(INFO) << "MemFree: " << mem_snap.sys_memfree_kb <<
+                " KB (Normal: " << mem_snap.normal_free_kb << " KB, Movable: " <<
+                mem_snap.movable_free_kb << " KB)";
 
         /*
          * if memtrack pthread is waiting on pressure decay, notify to
@@ -867,7 +889,7 @@ static void psi_mainloop(void) {
         //TODO: add more checks for memory stats such as reclaimable memory, zram etc.
         if ((pressure_level >= PRESSURE_EVT_5) &&        /* min threshold reached */
             (plugged_memory.load() < (uint64_t)max_plugged_memory) &&    /* max memory boundary */
-            (movable_free_kb < ((uint64_t)resolution * SIZE_1KB) / 2)) {    /* only if movable < 1/2 * resolution */
+            (mem_snap.movable_free_kb < ((uint64_t)resolution * SIZE_1KB) / 2)) {    /* only if movable < 1/2 * resolution */
 
             LOG(DEBUG) << "Plugging-in " << resolution << "MB of memory";
 
@@ -897,13 +919,13 @@ static void psi_mainloop(void) {
                     plugged_memory.load() <<
                     " MB. Total memory chunks plugged-in: "<<
                     mem_chunks_plugged.load();
-            normal_free_kb = get_zone_memfree_kb(zone_names[ZONE_NORMAL]);
-            movable_free_kb = get_zone_memfree_kb(zone_names[ZONE_MOVABLE]);
-            sys_memfree_kb = get_system_memfree_kb();
 
-            LOG(DEBUG) << "MemFree after PLUG: " << sys_memfree_kb <<
-                    " KB (Normal: " << normal_free_kb << " KB, Movable: " <<
-                    movable_free_kb<< " KB)";
+            if (system_memory_snapshot(&mem_snap))
+                continue;
+
+            LOG(DEBUG) << "MemFree after PLUG: " << mem_snap.sys_memfree_kb <<
+                    " KB (Normal: " << mem_snap.normal_free_kb << " KB, Movable: " <<
+                    mem_snap.movable_free_kb<< " KB)";
         }
     }
 }
@@ -934,6 +956,7 @@ int main(void) {
     pthread_t memtrack_thread;
     std::string thresholds;
     char str[LINE_MAX];
+    struct memory_snapshot mem_snap;
 
     /* get system PAGE_SIZE */
     sys_page_size = sysconf(_SC_PAGE_SIZE);
@@ -955,7 +978,6 @@ int main(void) {
         LOG(ERROR) << "Memory plugin init failed";
         return -EINVAL;
     }
-
 
     /* Initialize PSI monitors */
     if (init_and_register_psi_events()) {
@@ -979,7 +1001,6 @@ int main(void) {
 
     pthread_condattr_destroy(&thread_execution_cond_attr);
 
-
     for (i = 0; i < PRESSURE_EVT_COUNT; i++) {
         snprintf(str, sizeof(str), "%dMS ", psi_thresholds[i].threshold_ms);
         thresholds.append(str);
@@ -992,6 +1013,13 @@ int main(void) {
      get_max_memory_plugin_allowed(&max_plugged_memory);
     LOG(INFO) << "Memory plug-in resolution: " << resolution <<" MB";
     LOG(INFO) << "Maximum memory plug-in allowed: " << max_plugged_memory <<" MB";
+
+    if (system_memory_snapshot(&mem_snap))
+        return -EINVAL;
+
+    LOG(INFO) << "MemFree : " << mem_snap.sys_memfree_kb <<
+            " KB (Normal: " << mem_snap.normal_free_kb << " KB, Movable: " <<
+            mem_snap.movable_free_kb<< " KB)";
 
     LOG(INFO) << "Waiting for pressure events...";
     psi_mainloop();
