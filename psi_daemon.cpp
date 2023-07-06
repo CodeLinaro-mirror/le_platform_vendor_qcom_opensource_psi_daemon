@@ -129,6 +129,12 @@ static struct psi_threshold psi_thresholds[PRESSURE_EVT_COUNT] = {
     { PSI_SOME, 45 },  { PSI_SOME, 50 }
 };
 
+/*
+ * we wait until memory pressure decays below certain
+ * threshold before unplugging memory.
+ */
+static bool enable_pressure_decay_wait = false;
+
 /* global buffer for file reads */
 static char* readfile_buf;
 static ssize_t readfile_buf_size;
@@ -668,7 +674,7 @@ void* memtrack_thread_function(void *arg) {
 
     (void)(arg);
     struct timespec timeout;
-    uint64_t count = 0, mem_chunks_unplugged = 0;
+    uint64_t count = 0, mem_chunks_unplugged = 0, total_free = 0;
     uint64_t kernel_count = 0, kernel_chunks_plugged = 0;
     struct memory_snapshot mem_snap;
     int res;
@@ -702,8 +708,9 @@ startover:
          * its safe now to assume that no memory consuming usescases are running.
          */
 
-        /* wait until pressure is decayed to avg10=0.0 and avg60<0.5 */
-        wait_until_pressure_decay();
+        /* wait until pressure is decayed */
+        if (enable_pressure_decay_wait)
+            wait_until_pressure_decay();
 
         /* check if we received any new memory pressure event during pressure decay wait */
         if (get_atomic_variable_bool(cancel_check)) {
@@ -723,7 +730,16 @@ startover:
                 " KB (Normal: " << mem_snap.normal_free_kb << " KB, Movable: " <<
                 mem_snap.movable_free_kb << " KB)";
 
-        count = (mem_snap.movable_free_kb / SIZE_1KB) / resolution;
+        total_free = mem_snap.movable_free_kb;
+
+        /*
+         * inactive_file pages can be reclaimed easily, and
+         * inactive_anon pages can be swapped and reused.
+         */
+        total_free += mem_snap.movable_inactive_file_kb +
+                mem_snap.movable_inactive_anon_kb;
+
+        count = (total_free / SIZE_1KB) / resolution;
 
         LOG(DEBUG) << "Count " << count << " mem_chunks_plugged " <<
                 mem_chunks_plugged.load() << " resolution " << resolution <<
@@ -777,6 +793,10 @@ release_blocks:
         LOG(DEBUG) << "MemFree after UNPLUG: " << mem_snap.sys_memfree_kb <<
                 " KB (Normal: " << mem_snap.normal_free_kb << " KB, Movable: " <<
                 mem_snap.movable_free_kb<< " KB)";
+
+        if (!mem_chunks_plugged)
+            LOG(INFO) << "Unplugged all memory!!";
+
         //TODO: should we keep checking until all plugged memory is unplugged? goto startover ?
 
         /* now lets wait for notify again... */
