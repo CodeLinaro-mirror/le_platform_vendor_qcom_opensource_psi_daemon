@@ -1,7 +1,8 @@
 [Unit]
 SourcePath=/usr/bin/psi_daemon
 Description=PSI Daemon
-After=sysinit.target
+Wants=dev-qti_virtio_mem.device
+After=dev-qti_virtio_mem.device sysinit.target
 
 [Service]
 User=system
