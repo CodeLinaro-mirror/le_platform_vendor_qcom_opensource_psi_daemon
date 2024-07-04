@@ -13,6 +13,9 @@ ExecStartPre=+/bin/chmod 0664 /proc/pressure/memory
 ExecStartPre=+/bin/chown system:system /proc/pressure/memory
 ExecStartPre=+/bin/chmod 0222 /sys/devices/virtual/qti_virtio_mem/qti_virtio_mem/kernel_unplug
 ExecStartPre=+/bin/chown system:system /sys/devices/virtual/qti_virtio_mem/qti_virtio_mem/kernel_unplug
+#lowmem_reserve_ratio is owned by root and cannot be chown'd
+#choose the maximum possible value to prevent movable zone allocations from falling back to normal zone
+ExecStartPre=+/bin/bash -c "echo 1 > /proc/sys/vm/lowmem_reserve_ratio"
 SupplementaryGroups=wakelock
 ExecStart=/usr/bin/psi_daemon
 CapabilityBoundingSet=CAP_SYS_RESOURCE CAP_BLOCK_SUSPEND
