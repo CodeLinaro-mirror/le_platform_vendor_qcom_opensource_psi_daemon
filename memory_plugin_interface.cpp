@@ -160,6 +160,9 @@ int get_kernel_plugin_count(size_t *count) {
 int memory_unplug_request_kernel(size_t count) {
     char str_val[LINE_MAX];
 
+    if (!count)
+	    return 0;
+
     snprintf(str_val, sizeof(str_val), "%lu", count);
     if (write_file(QVM_NUM_KERNEL_UNPLUG_PATH, str_val)) {
         LOG(ERROR) << "Failed to write to " << QVM_NUM_KERNEL_UNPLUG_PATH;
