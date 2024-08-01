@@ -115,6 +115,7 @@ struct memory_snapshot {
     uint64_t movable_free_kb;
     uint64_t movable_inactive_anon_kb;
     uint64_t movable_inactive_file_kb;
+    uint64_t swap_free_kb;
 };
 
 struct psi_pressure {
@@ -180,6 +181,11 @@ std::atomic<bool> wait_in_progress(false);
 
 /* stall tracking window size, 50ms*/
 static int PSI_WINDOW_SIZE_US = (50 * US_PER_MS);
+/*
+ * The percent reduction in size of anonymous memory after being
+ * swapped out and compressed by zram.
+ */
+static const int ZRAM_COMPRESSION_RATIO_PCT = 50;
 
 #define TARGET_OOM_SCORE_ADJ    -1000
 
@@ -389,6 +395,8 @@ static int system_memory_snapshot(struct memory_snapshot *mem_snap)
 
     if(parse_field(buf, "MemFree", &mem_snap->sys_memfree_kb))
         goto err;
+    if(parse_field(buf, "SwapFree", &mem_snap->swap_free_kb))
+	    goto err;
     res = 0;
 
 err:
@@ -707,6 +715,31 @@ int __weak get_kernel_plugin_count(size_t __unused *count) {
     return -ENOTTY;
 }
 
+static uint64_t get_memsnap_and_total_free(struct memory_snapshot *mem_snap)
+{
+    uint64_t free;
+
+    if (system_memory_snapshot(mem_snap))
+        return 0;
+
+   /*
+    * inactive_file pages can be reclaimed easily, and
+    * inactive_anon pages can be swapped and reused.
+    *
+    * Discount inactive anon by a factor of 2 assuming a compression ratio
+    * of 50% with zram.
+    *
+    * Free pages in the normal zone are ignored; lowmem_reserve is assumed
+    * to prohibit fallback from movable to normal zone.
+    */
+    free = mem_snap->movable_free_kb +
+	    mem_snap->movable_inactive_file_kb;
+    free += std::min(mem_snap->swap_free_kb, mem_snap->movable_inactive_anon_kb) *
+            ZRAM_COMPRESSION_RATIO_PCT / 100;
+
+    return free;
+}
+
 void* memtrack_thread_function(void *arg) {
 
     (void)(arg);
@@ -763,7 +796,8 @@ startover:
         //TODO: add more checks for memory stats such as reclaimable memory, zram etc.
 
         /* take snapshot of memory */
-        if (system_memory_snapshot(&mem_snap))
+        total_free = get_memsnap_and_total_free(&mem_snap);
+        if (!total_free)
             continue;
 
         LOG(INFO) << "MemFree before UNPLUG: " << mem_snap.sys_memfree_kb <<
@@ -772,15 +806,6 @@ startover:
 
         LOG(INFO) << "Movable inactive_file: " << mem_snap.movable_inactive_file_kb <<
                         " KB : inactive_anon: " << mem_snap.movable_inactive_anon_kb << " KB";
-
-        total_free = mem_snap.movable_free_kb;
-
-        /*
-         * inactive_file pages can be reclaimed easily, and
-         * inactive_anon pages can be swapped and reused.
-         */
-        total_free += mem_snap.movable_inactive_file_kb +
-                mem_snap.movable_inactive_anon_kb;
 
         count = (total_free / SIZE_1KB) / resolution;
 
