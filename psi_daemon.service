@@ -3,6 +3,7 @@ SourcePath=/usr/bin/psi_daemon
 Description=PSI Daemon
 Wants=dev-qti_virtio_mem.device
 After=dev-qti_virtio_mem.device sysinit.target
+Before=tvmroot.service
 
 [Service]
 User=system
