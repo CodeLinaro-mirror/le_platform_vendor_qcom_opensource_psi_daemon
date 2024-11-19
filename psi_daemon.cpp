@@ -798,7 +798,7 @@ startover:
         /* take snapshot of memory */
         total_free = get_memsnap_and_total_free(&mem_snap);
         if (!total_free)
-            continue;
+            goto retry;
 
         LOG(INFO) << "MemFree before UNPLUG: " << mem_snap.sys_memfree_kb <<
                 " KB (Normal: " << mem_snap.normal_free_kb << " KB, Movable: " <<
@@ -856,12 +856,13 @@ release_blocks:
 
         /* take memory snapshot after unplugging */
         if (system_memory_snapshot(&mem_snap))
-            continue;
+            goto retry;
 
         LOG(DEBUG) << "MemFree after UNPLUG: " << mem_snap.sys_memfree_kb <<
                 " KB (Normal: " << mem_snap.normal_free_kb << " KB, Movable: " <<
                 mem_snap.movable_free_kb<< " KB)";
 
+retry:
         if (mem_chunks_plugged && retry_count < MAX_UNPLUG_RETRY) {
             ++retry_count;
             LOG(INFO) << "Retrying unplug after " << IDLE_WAIT_TIME_S <<
@@ -869,6 +870,8 @@ release_blocks:
             goto startover;
         }
         else {
+	    if (!total_free)
+		LOG(INFO) << "No free memory left to unplug";
             if (retry_count == MAX_UNPLUG_RETRY)
                 LOG(INFO) << "Max retry attempt reached for unplugging!!";
             if (!mem_chunks_plugged)
@@ -877,7 +880,6 @@ release_blocks:
         }
 
         //TODO: should we keep checking until all plugged memory is unplugged? goto startover ?
-
         if(wake_locked && !wake_unlock())
             LOG (ERROR) << "failed to wake unlock";
         else
