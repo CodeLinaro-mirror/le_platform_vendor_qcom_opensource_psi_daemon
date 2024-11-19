@@ -757,8 +757,6 @@ void* memtrack_thread_function(void *arg) {
                 &thread_execution_mutex, NULL);
 
 startover:
-        if (!wake_locked && wake_lock_acquire())
-            wake_locked = 1;
         mem_chunks_unplugged = 0;
         clock_gettime(CLOCK_MONOTONIC, &timeout);
         timeout.tv_sec += IDLE_WAIT_TIME_S;
@@ -813,6 +811,14 @@ startover:
                 mem_chunks_plugged.load() << " resolution " << resolution <<
                 " MB plugged_memory " << plugged_memory.load() << " MB";
 
+        if (!wake_locked && wake_lock_acquire())
+            wake_locked = 1;
+	/*
+	 * Increasing threshold for free/reclaimable pages by one memory chunk.
+	 * More details are captured in commit log.
+	 */
+	if (count <= 1)
+		goto wake_unlock;
         /* first release blocks added by kernel */
         if (get_kernel_plugin_count(&kernel_chunks_plugged) < 0) {
             LOG(ERROR) << "failed to get kernel plugin count";
@@ -863,7 +869,7 @@ release_blocks:
                 mem_snap.movable_free_kb<< " KB)";
 
 retry:
-        if (mem_chunks_plugged && retry_count < MAX_UNPLUG_RETRY) {
+        if (!mem_chunks_unplugged && mem_chunks_plugged && retry_count < MAX_UNPLUG_RETRY) {
             ++retry_count;
             LOG(INFO) << "Retrying unplug after " << IDLE_WAIT_TIME_S <<
                     " seconds (retry attempt: " << retry_count << ")";
@@ -879,6 +885,7 @@ retry:
             retry_count = 0;
         }
 
+wake_unlock:
         //TODO: should we keep checking until all plugged memory is unplugged? goto startover ?
         if(wake_locked && !wake_unlock())
             LOG (ERROR) << "failed to wake unlock";
