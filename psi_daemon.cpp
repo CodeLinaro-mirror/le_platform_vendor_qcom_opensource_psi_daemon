@@ -1070,6 +1070,7 @@ int main(void) {
     std::string thresholds;
     char str[LINE_MAX];
     struct memory_snapshot mem_snap;
+    size_t kernel_count;
 
     /* get system PAGE_SIZE */
     sys_page_size = sysconf(_SC_PAGE_SIZE);
@@ -1126,6 +1127,14 @@ int main(void) {
      get_max_memory_plugin_allowed(&max_plugged_memory);
     LOG(INFO) << "Memory plug-in resolution: " << resolution <<" MB";
     LOG(INFO) << "Maximum memory plug-in allowed: " << max_plugged_memory <<" MB";
+
+    /* reclaim any memory blocks added by kernel */
+    if (get_kernel_plugin_count(&kernel_count) < 0) {
+        LOG(ERROR) << "failed to get kernel plugin count";
+        return -EINVAL;
+    }
+    LOG(INFO) << "kernel_count during psi_daemon bootup: " << kernel_count;
+    memory_unplug_request_kernel(kernel_count);
 
     if (system_memory_snapshot(&mem_snap))
         return -EINVAL;
