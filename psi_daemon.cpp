@@ -485,7 +485,7 @@ static int register_epoll_events(int epollfd, int psi_event_fd, void *data) {
     struct epoll_event epevent;
 
     /* register for epoll with EPOLLPRI and EPOLLWAKEUP events */
-    epevent.events = EPOLLPRI | EPOLLWAKEUP;
+    epevent.events = EPOLLPRI;
     epevent.data.ptr = data;
     res = epoll_ctl(epollfd, EPOLL_CTL_ADD, psi_event_fd, &epevent);
     if (res < 0) {
