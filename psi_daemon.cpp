@@ -24,6 +24,7 @@
 #include <pthread.h>
 #include <base/logging.h>
 #include <atomic>
+#include <sys/mman.h>
 
 #ifndef __weak
 #define __weak __attribute__((weak))
@@ -485,7 +486,7 @@ static int register_epoll_events(int epollfd, int psi_event_fd, void *data) {
     struct epoll_event epevent;
 
     /* register for epoll with EPOLLPRI and EPOLLWAKEUP events */
-    epevent.events = EPOLLPRI | EPOLLWAKEUP;
+    epevent.events = EPOLLPRI;
     epevent.data.ptr = data;
     res = epoll_ctl(epollfd, EPOLL_CTL_ADD, psi_event_fd, &epevent);
     if (res < 0) {
@@ -1079,6 +1080,9 @@ int main(void) {
         return -EINVAL;
     }
 
+    if (mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT) && (errno != EINVAL)) {
+	    LOG(ERROR) << "mlock failed!! System can't behave as expected";
+    }
     readfile_buf_size = sys_page_size;
 
     /* allocate buffer for file reads */
