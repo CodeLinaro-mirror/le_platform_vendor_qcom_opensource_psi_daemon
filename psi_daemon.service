@@ -20,8 +20,8 @@ ExecStartPre=+/bin/chown system:system /sys/devices/virtual/qti_virtio_mem/qti_v
 ExecStartPre=+/bin/sh -c "echo 1 > /proc/sys/vm/lowmem_reserve_ratio"
 SupplementaryGroups=wakelock
 ExecStart=/usr/bin/psi_daemon
-CapabilityBoundingSet=CAP_SYS_RESOURCE CAP_BLOCK_SUSPEND
-AmbientCapabilities=CAP_SYS_RESOURCE CAP_BLOCK_SUSPEND
+CapabilityBoundingSet=CAP_SYS_RESOURCE CAP_BLOCK_SUSPEND CAP_IPC_LOCK
+AmbientCapabilities=CAP_SYS_RESOURCE CAP_BLOCK_SUSPEND CAP_IPC_LOCK
 
 [Install]
 WantedBy=multi-user.target
