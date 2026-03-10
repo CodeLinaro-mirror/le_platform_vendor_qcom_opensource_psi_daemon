@@ -8,6 +8,8 @@ Before=tvmroot.service
 [Service]
 User=system
 Groups=system
+StandardOutput=journal
+StandardError=journal
 RemainAfterExit=yes
 Restart=yes
 Nice=-20
