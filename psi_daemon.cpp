@@ -192,7 +192,12 @@ std::atomic<bool> wait_in_progress(false);
 uint64_t movable_pgalloc_last_unplug;
 
 /* default wait time for pressure to be idle (in seconds) */
-#define IDLE_WAIT_TIME_S    10
+#define IDLE_WAIT_TIME_S    3
+
+/* The retry timer is for retrying unplug procedure if there are still
+ * blocks present after the current unplug procedure.
+ * */
+#define RETRY_WAIT_TIME_S   1
 
 /* stall tracking window size, 50ms*/
 static int PSI_WINDOW_SIZE_US = (50 * US_PER_MS);
@@ -777,6 +782,17 @@ static uint64_t get_memsnap_and_total_free(struct memory_snapshot *mem_snap)
     return free;
 }
 
+static inline int new_pressure_event_received()
+{
+    if (get_atomic_variable_bool(cancel_check)) {
+        set_atomic_variable_bool(cancel_check, false);
+        set_atomic_variable_bool(wait_in_progress, false);
+        return 1;
+    }
+
+    return 0;
+}
+
 static inline uint64_t get_movable_pgalloc_nr()
 {
     char *buf;
@@ -818,7 +834,7 @@ void* memtrack_thread_function(void *arg) {
     uint64_t count = 0, mem_chunks_unplugged = 0, total_free = 0;
     uint64_t kernel_count = 0, kernel_chunks_plugged = 0;
     struct memory_snapshot mem_snap;
-    int res, retry_count = 0;
+    int res, retry_count;
     unsigned int wake_locked = 0;
 
     while (1) {
@@ -826,27 +842,28 @@ void* memtrack_thread_function(void *arg) {
         /* lets wait for notify */
         wait_for_condition_timed(&thread_execution_cond,
                 &thread_execution_mutex, NULL);
+        retry_count = 0;
 
 startover:
         mem_chunks_unplugged = 0;
         clock_gettime(CLOCK_MONOTONIC, &timeout);
-        timeout.tv_sec += IDLE_WAIT_TIME_S;
+        if (!retry_count)
+            timeout.tv_sec += IDLE_WAIT_TIME_S;
+        else
+            timeout.tv_sec += RETRY_WAIT_TIME_S;
 
         set_atomic_variable_bool(wait_in_progress, true);
 
-        /* wait for IDLE_WAIT_TIME_S seconds of idle in memory pressure */
+        /* wait few seconds of idle in memory pressure */
         wait_for_condition_timed(&thread_execution_cond,
                 &thread_execution_mutex, &timeout);
 
         /* check if we received any new memory pressure event during idle time wait */
-        if (get_atomic_variable_bool(cancel_check)) {
-            set_atomic_variable_bool(cancel_check, false);
-            set_atomic_variable_bool(wait_in_progress, false);
+        if (new_pressure_event_received())
             goto startover;
-        }
 
         /*
-         * we have passed the IDLE_WAIT_TIME_S seconds of idle in memory pressure.
+         * we have passed beyond some time of idle memory pressure.
          * its safe now to assume that no memory consuming usescases are running.
          */
 
@@ -855,11 +872,8 @@ startover:
             wait_until_pressure_decay();
 
         /* check if we received any new memory pressure event during pressure decay wait */
-        if (get_atomic_variable_bool(cancel_check)) {
-            set_atomic_variable_bool(cancel_check, false);
-            set_atomic_variable_bool(wait_in_progress, false);
+        if (new_pressure_event_received())
             goto startover;
-        }
 
         /* didn't receive any new memory pressure events, so time to release memory to PVM */
         //TODO: add more checks for memory stats such as reclaimable memory, zram etc.
@@ -871,7 +885,7 @@ startover:
 
         LOG(INFO) << "MemFree before UNPLUG: " << mem_snap.sys_memfree_kb <<
                 " KB (Normal: " << mem_snap.normal_free_kb << " KB, Movable: " <<
-                mem_snap.movable_free_kb << " KB)";
+                mem_snap.movable_free_kb << " KB, swap_free_kb: " << mem_snap.swap_free_kb << " KB)";
 
         LOG(INFO) << "Movable inactive_file: " << mem_snap.movable_inactive_file_kb <<
                         " KB : inactive_anon: " << mem_snap.movable_inactive_anon_kb << " KB";
@@ -884,12 +898,7 @@ startover:
 
         if (!wake_locked && wake_lock_acquire())
             wake_locked = 1;
-	/*
-	 * Increasing threshold for free/reclaimable pages by one memory chunk.
-	 * More details are captured in commit log.
-	 */
-	if (count <= 1)
-		goto wake_unlock;
+
         /* first release blocks added by kernel */
         if (get_kernel_plugin_count(&kernel_chunks_plugged) < 0) {
             LOG(ERROR) << "failed to get kernel plugin count";
@@ -914,6 +923,8 @@ release_blocks:
         count = std::min(count, mem_chunks_plugged.load());
         LOG(INFO) << "Count after kernel unplug: " << count;
 
+        /*     *** unplugging ***     */
+
         while(count-- > 0) {
             res = memory_unplug_request(resolution);
             if (res) {
@@ -930,7 +941,7 @@ release_blocks:
         if (mem_chunks_unplugged)
             LOG(INFO) << "Unplugged " << mem_chunks_unplugged <<
                 " memory chunks. Total memory unplugged: " <<
-                mem_chunks_unplugged << " MB";
+                mem_chunks_unplugged * resolution << " MB";
         plugged_memory -= (resolution * mem_chunks_unplugged);
         mem_chunks_plugged -= mem_chunks_unplugged;
 
@@ -946,15 +957,16 @@ release_blocks:
                 mem_snap.movable_free_kb<< " KB)";
 
 retry:
-        if (!mem_chunks_unplugged && mem_chunks_plugged && retry_count < MAX_UNPLUG_RETRY) {
+        /* if there are still blocks being plugged-in, retry and startover */
+        if (mem_chunks_plugged && retry_count < MAX_UNPLUG_RETRY) {
             ++retry_count;
-            LOG(INFO) << "Retrying unplug after " << IDLE_WAIT_TIME_S <<
+            LOG(INFO) << "Retrying unplug after " << RETRY_WAIT_TIME_S <<
                     " seconds (retry attempt: " << retry_count << ")";
             goto startover;
         }
         else {
-	    if (!total_free)
-		LOG(INFO) << "No free memory left to unplug";
+            if (!total_free)
+                LOG(INFO) << "No free memory left to unplug";
             if (retry_count == MAX_UNPLUG_RETRY)
                 LOG(INFO) << "Max retry attempt reached for unplugging!!";
             if (!mem_chunks_plugged)
@@ -962,7 +974,6 @@ retry:
             retry_count = 0;
         }
 
-wake_unlock:
         //TODO: should we keep checking until all plugged memory is unplugged? goto startover ?
         if(wake_locked && !wake_unlock())
             LOG (ERROR) << "failed to wake unlock";
