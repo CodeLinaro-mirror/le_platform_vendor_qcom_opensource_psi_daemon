@@ -81,6 +81,7 @@ static const char* const zone_names[ZONE_MAX] = {
 
 #define MEMINFO_PATH    "/proc/meminfo"
 #define ZONEINFO_PATH   "/proc/zoneinfo"
+#define VMSTAT_PATH     "/proc/vmstat"
 #define PSI_MEMORY_PATH "/proc/pressure/memory"
 
 #define WAKE_LOCK_PATH   "/sys/power/wake_lock"
@@ -116,6 +117,8 @@ struct memory_snapshot {
     uint64_t movable_free_kb;
     uint64_t movable_inactive_anon_kb;
     uint64_t movable_inactive_file_kb;
+    uint64_t pgalloc_normal_nr;
+    uint64_t pgalloc_movable_nr;
     uint64_t swap_free_kb;
 };
 
@@ -166,6 +169,11 @@ int32_t event_fds[PRESSURE_EVT_COUNT];
 /* fd for main epoll_wait */
 int32_t psi_epollfd = -1;
 
+struct timespec last_remove_time;
+
+/* disallow memblock addition witin 2s after the last memblock remove (window) */
+static const uint32_t HOLD_OFF_AFTER_REMOVE_MS = 2000;
+
 #define EXP_1S_10S      0.9048F     /* 1/exp(1s/10s) */
 #define EXP_1S_60S      0.9834F     /* 1/exp(1s/60s) */
 #define EXP_1S_300S     0.9966F     /* 1/exp(1s/300s) */
@@ -176,6 +184,12 @@ static pthread_condattr_t thread_execution_cond_attr;
 
 std::atomic<bool> cancel_check(false);
 std::atomic<bool> wait_in_progress(false);
+
+/* minimal increase in nr_pgalloc pages, which can be considered as allocation activity */
+#define PGALLOC_GROWTH_THRESHOLD      1000
+
+/* nr_pfalloc of Movable zone after last unplug of a block */
+uint64_t movable_pgalloc_last_unplug;
 
 /* default wait time for pressure to be idle (in seconds) */
 #define IDLE_WAIT_TIME_S    10
@@ -332,6 +346,11 @@ static char *get_meminfo(void)
     return read_file(MEMINFO_PATH);
 }
 
+static char *get_vmstat(void)
+{
+    return read_file(VMSTAT_PATH);
+}
+
 static int parse_zone_field(char *buf, const char *zone_name,
         const char *field_name, uint64_t *val)
 {
@@ -360,6 +379,9 @@ static int system_memory_snapshot(struct memory_snapshot *mem_snap)
     int res = -1;
 
     pthread_mutex_lock(&fileread_buffer_mutex);
+
+    /***** get zoneinfo *****/
+
     buf = get_zoneinfo();
     if (!buf)
         goto err;
@@ -390,6 +412,8 @@ static int system_memory_snapshot(struct memory_snapshot *mem_snap)
         mem_snap->movable_inactive_file_kb = 0;
     mem_snap->movable_inactive_file_kb *= sys_page_size / SIZE_1KB;
 
+    /***** get meminfo *****/
+
     buf = get_meminfo();
     if (!buf)
         goto err;
@@ -398,6 +422,18 @@ static int system_memory_snapshot(struct memory_snapshot *mem_snap)
         goto err;
     if(parse_field(buf, "SwapFree", &mem_snap->swap_free_kb))
 	    goto err;
+
+    /***** get vmstat *****/
+
+    buf = get_vmstat();
+    if (!buf)
+        goto err;
+
+    if(parse_field(buf, "pgalloc_normal", &mem_snap->pgalloc_normal_nr))
+        goto err;
+    if(parse_field(buf, "pgalloc_movable", &mem_snap->pgalloc_movable_nr))
+        goto err;
+
     res = 0;
 
 err:
@@ -741,6 +777,40 @@ static uint64_t get_memsnap_and_total_free(struct memory_snapshot *mem_snap)
     return free;
 }
 
+static inline uint64_t get_movable_pgalloc_nr()
+{
+    char *buf;
+    uint64_t pgalloc_movable_nr;
+
+    pthread_mutex_lock(&fileread_buffer_mutex);
+    buf = get_vmstat();
+    if (!buf)
+        goto err;
+
+    if(parse_field(buf, "pgalloc_movable", &pgalloc_movable_nr))
+        goto err;
+
+    pthread_mutex_unlock(&fileread_buffer_mutex);
+    return pgalloc_movable_nr;
+
+err:
+    LOG(ERROR) << "failed to get memory snapshot";
+    pthread_mutex_unlock(&fileread_buffer_mutex);
+    return 0;
+}
+
+/* Returns 1 if pgalloc_new > pgalloc_old by more than PGALLOC_GROWTH_THRESHOLD */
+static inline int system_allocation_activity(uint64_t pgalloc_old, uint64_t pgalloc_new)
+{
+    if (pgalloc_old == 0)
+        return 0;
+
+    if (pgalloc_new <= pgalloc_old)
+        return 0;
+
+    return ((pgalloc_new - pgalloc_old) >= PGALLOC_GROWTH_THRESHOLD) ? 1 : 0;
+}
+
 void* memtrack_thread_function(void *arg) {
 
     (void)(arg);
@@ -851,6 +921,9 @@ release_blocks:
                         resolution << "MB";
                 continue;
             }
+            /* update remove holdoff window */
+            clock_gettime(CLOCK_MONOTONIC, &last_remove_time);
+            movable_pgalloc_last_unplug = get_movable_pgalloc_nr();
             mem_chunks_unplugged++;
         }
 
@@ -860,6 +933,9 @@ release_blocks:
                 mem_chunks_unplugged << " MB";
         plugged_memory -= (resolution * mem_chunks_unplugged);
         mem_chunks_plugged -= mem_chunks_unplugged;
+
+        /* update remove holdoff window */
+        clock_gettime(CLOCK_MONOTONIC, &last_remove_time);
 
         /* take memory snapshot after unplugging */
         if (system_memory_snapshot(&mem_snap))
@@ -959,6 +1035,35 @@ static uint64_t get_timespec_delta_us(struct timespec start_tv, struct timespec 
     return (end_us - start_us);
 }
 
+static int64_t timespec_diff_ms(const struct timespec *a,
+                                const struct timespec *b)
+{
+    int64_t sec_diff  = (int64_t)a->tv_sec - (int64_t)b->tv_sec;
+    int64_t nsec_diff = (int64_t)a->tv_nsec - (int64_t)b->tv_nsec;
+
+    return sec_diff * 1000 + nsec_diff / 1000000;
+}
+
+static inline bool within_remove_holdoff()
+{
+	struct timespec current;
+	int64_t elapsed_ms;
+
+    if (last_remove_time.tv_sec == 0 && last_remove_time.tv_nsec == 0) {
+        // No prior remove; not within hold-off.
+        return false;
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &current);
+    elapsed_ms = timespec_diff_ms(&current, &last_remove_time);
+
+    /* negative elapsed means clocks not monotonic */
+    if (elapsed_ms < 0)
+        return false;
+
+    return (uint64_t)elapsed_ms < (uint64_t)HOLD_OFF_AFTER_REMOVE_MS;
+}
+
 static void psi_mainloop(void) {
     pressure_levels pressure_level = PRESSURE_NONE;
     struct timespec cur, start, end;
@@ -1004,6 +1109,28 @@ static void psi_mainloop(void) {
         if ((pressure_level >= PRESSURE_EVT_5) &&        /* min threshold reached */
             (plugged_memory.load() < (uint64_t)max_plugged_memory) &&    /* max memory boundary */
             (mem_snap.movable_free_kb < ((uint64_t)resolution * SIZE_1KB) / 2)) {    /* only if movable < 1/2 * resolution */
+
+            /*
+             * if we recently had a memblock remove, we would expect PSI pressure
+             * to increase due to kernel doing migration, compaction, update zone
+             * watermarks, takes required locks etc., which leads to temporary stalling
+             * of processes leading to PSI events (PSI_SOME) being fired. This would
+             * lead us here trying to plug a block again. This leads to "ping-pong"
+             * effect of memory blocks being removed-added-removed again later.
+             *
+             * One reliable way to check for natural pressure vs PSI due to unplug
+             * is to check for growth in pgalloc_movable allocations and having
+             * a hold-off window after unplug to temporarily ignore PSI events
+             * occuring due to unplug. If still within hold-off period and pgalloc_movable
+             * has increased significantly, then its considered as PSI pressure due
+             * to movable allocation activity, and we go ahead and plug-in memory block
+             * irrespective of if we witin the remove holdoff period.
+             */
+            if (within_remove_holdoff() &&
+                    !system_allocation_activity(movable_pgalloc_last_unplug, get_movable_pgalloc_nr())) {
+                LOG(INFO) <<"PSI pressure within Remove Holdoff period. IGNORING PRESSURE EVEVNT...";
+                continue;
+            }
 
             LOG(DEBUG) << "Plugging-in " << resolution << "MB of memory";
 
