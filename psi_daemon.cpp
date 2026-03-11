@@ -789,8 +789,12 @@ static uint64_t get_memsnap_and_total_free(struct memory_snapshot *mem_snap)
     */
     free = mem_snap->movable_free_kb +
 	    mem_snap->movable_inactive_file_kb;
+
     free += std::min(mem_snap->swap_free_kb, mem_snap->movable_inactive_anon_kb) *
             ZRAM_COMPRESSION_RATIO_PCT / 100;
+
+    if (mem_snap->swap_free_kb && mem_snap->normal_free_kb > resolution * SIZE_1KB)
+        free += (mem_snap->normal_free_kb);
 
     return free;
 }
