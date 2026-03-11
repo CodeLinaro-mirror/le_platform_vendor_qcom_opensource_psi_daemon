@@ -157,6 +157,18 @@ int get_kernel_plugin_count(size_t *count) {
     return 0;
 }
 
+int get_total_block_plugin_count(size_t *count) {
+    char *buf;
+
+    buf = read_file(QVM_NUM_BLOCK_PLUGGED_PATH);
+    if (!buf)
+        return -EINVAL;
+
+    *count = strtoul(buf, 0, 10);
+
+    return 0;
+}
+
 int memory_unplug_request_kernel(size_t count) {
     char str_val[LINE_MAX];
 
