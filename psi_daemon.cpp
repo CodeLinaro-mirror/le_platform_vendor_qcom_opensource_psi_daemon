@@ -784,14 +784,19 @@ static uint64_t get_memsnap_and_total_free(struct memory_snapshot *mem_snap)
     *
     * Discount inactive anon by a factor of 2 assuming a compression ratio
     * of 50% with zram.
-    *
-    * Free pages in the normal zone are ignored; lowmem_reserve is assumed
-    * to prohibit fallback from movable to normal zone.
     */
     free = mem_snap->movable_free_kb +
 	    mem_snap->movable_inactive_file_kb;
+
     free += std::min(mem_snap->swap_free_kb, mem_snap->movable_inactive_anon_kb) *
             ZRAM_COMPRESSION_RATIO_PCT / 100;
+
+    /*
+     * include  Normal free as well which can be used to host active pages
+     * from Movable zone for unplug.
+     */
+    if (mem_snap->swap_free_kb && mem_snap->normal_free_kb > resolution * SIZE_1KB)
+        free += (mem_snap->normal_free_kb);
 
     return free;
 }
