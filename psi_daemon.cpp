@@ -24,7 +24,6 @@
 #include <pthread.h>
 #include <base/logging.h>
 #include <atomic>
-#include <sys/mman.h>
 
 #ifndef __weak
 #define __weak __attribute__((weak))
@@ -1080,9 +1079,6 @@ int main(void) {
         return -EINVAL;
     }
 
-    if (mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT) && (errno != EINVAL)) {
-	    LOG(ERROR) << "mlock failed!! System can't behave as expected";
-    }
     readfile_buf_size = sys_page_size;
 
     /* allocate buffer for file reads */
