@@ -1,9 +1,8 @@
 [Unit]
 SourcePath=/usr/bin/psi_daemon
 Description=PSI Daemon
-Wants=dev-qti_virtio_mem.device
-After=dev-qti_virtio_mem.device sysinit.target
-Before=tvmroot.service
+Before=tvmroot.service systemd-udev-trigger.service systemd-journald.service
+DefaultDependencies=no
 
 [Service]
 User=system
@@ -13,6 +12,8 @@ StandardError=journal
 RemainAfterExit=yes
 Restart=yes
 Nice=-20
+ExecStartPre=+/bin/chgrp system /dev/qti_virtio_mem
+ExecStartPre=+/bin/chmod 0660 /dev/qti_virtio_mem
 ExecStartPre=+/bin/chmod 0664 /proc/pressure/memory
 ExecStartPre=+/bin/chown system:system /proc/pressure/memory
 ExecStartPre=+/bin/chmod 0222 /sys/devices/virtual/qti_virtio_mem/qti_virtio_mem/kernel_unplug
