@@ -24,6 +24,7 @@
 #include <pthread.h>
 #include <base/logging.h>
 #include <atomic>
+#include <signal.h>
 
 #ifndef __weak
 #define __weak __attribute__((weak))
@@ -1063,14 +1064,57 @@ void set_oom_score_adj_self(int adj)
     close(fd);
 }
 
+static void notify_wakeup(void) {
+    /* notify memtrack thread that we received new SIGUSR1 event to wakeup */
+    LOG (INFO) << "Sending signal to memtrack thread to wakeup.";
+    pthread_cond_signal(&thread_execution_cond);
+}
+
+void* signal_thread(void* arg) {
+
+    (void)arg;
+    int sig, ret;
+    sigset_t signal;
+
+    sigemptyset(&signal);
+    sigaddset(&signal, SIGUSR1);
+
+    /* ensure SIGUSR1 is blocked in this thread too (should already be via main) */
+    pthread_sigmask(SIG_BLOCK, &signal, NULL);
+
+    for (;;) {
+
+        /* wait for SIGUSR1 signal. blocks until SIGUSR1 is pending */
+        ret = sigwait(&signal, &sig);
+
+        if (ret == 0 && sig == SIGUSR1) {
+            LOG(INFO) << "Received SIGUSR1 event";
+            /* notify reclaim thread to wakeup */
+            notify_wakeup();
+        }
+    }
+
+    return NULL;
+}
+
 int main(void) {
 
     int i;
-    pthread_t memtrack_thread;
+    pthread_t memtrack_thread, sigusr1_thread;
     std::string thresholds;
     char str[LINE_MAX];
     struct memory_snapshot mem_snap;
     size_t kernel_count;
+    sigset_t signal;
+
+    sigemptyset(&signal);
+    sigaddset(&signal, SIGUSR1);
+
+    /* Block SIGUSR1 in the main thread before creating any threads. */
+    if (pthread_sigmask(SIG_BLOCK, &signal, NULL) != 0) {
+        LOG(ERROR) << "pthread_sigmask failed";
+        return -EINVAL;
+    }
 
     /* get system PAGE_SIZE */
     sys_page_size = sysconf(_SC_PAGE_SIZE);
@@ -1110,6 +1154,12 @@ int main(void) {
     /* create pthread for downword memory pressure tracking */
     if (pthread_create(&memtrack_thread, NULL, &memtrack_thread_function, NULL)) {
         LOG(ERROR) << "Error creating pthread for downward mem tracking";
+        return -EINVAL;
+    }
+
+    /* create pthread for listening to SIGUSR1 events from userspace */
+    if (pthread_create(&sigusr1_thread, NULL, &signal_thread, NULL)) {
+        LOG(ERROR) << "Error creating pthread for SIGUSR1 event tracking";
         return -EINVAL;
     }
 
