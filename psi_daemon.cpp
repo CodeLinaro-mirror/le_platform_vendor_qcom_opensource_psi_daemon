@@ -192,7 +192,21 @@ std::atomic<bool> wait_in_progress(false);
 uint64_t movable_pgalloc_last_unplug;
 
 /* default wait time for pressure to be idle (in seconds) */
-#define IDLE_WAIT_TIME_S    10
+#define IDLE_WAIT_TIME_S    3
+
+/* The retry timer is for retrying unplug procedure if there are still
+ * blocks present after the current unplug procedure.
+ * */
+#define RETRY_WAIT_TIME_S   1
+
+/*
+ * minimum Movable zone managed memory to be persistent always (in MBs).
+ * This value is obtained from target specific compile flag.
+ * Reset it to 0 if flag isn't defined.
+ */
+#ifndef MIN_MOVABLE_SIZE_PERSISTENT_MB
+#define MIN_MOVABLE_SIZE_PERSISTENT_MB   0
+#endif
 
 /* stall tracking window size, 50ms*/
 static int PSI_WINDOW_SIZE_US = (50 * US_PER_MS);
@@ -752,6 +766,10 @@ int __weak get_kernel_plugin_count(size_t __unused *count) {
     return -ENOTTY;
 }
 
+int __weak get_total_block_plugin_count(size_t __unused *count) {
+    return -ENOTTY;
+}
+
 static uint64_t get_memsnap_and_total_free(struct memory_snapshot *mem_snap)
 {
     uint64_t free;
@@ -775,6 +793,103 @@ static uint64_t get_memsnap_and_total_free(struct memory_snapshot *mem_snap)
             ZRAM_COMPRESSION_RATIO_PCT / 100;
 
     return free;
+}
+
+static inline int64_t get_movable_zspage_nr()
+{
+    char *buf;
+    uint64_t movable_nr_zspages;
+
+    pthread_mutex_lock(&fileread_buffer_mutex);
+    buf = get_zoneinfo();
+    if (!buf)
+        goto err;
+
+    if (parse_zone_field(buf, zone_names[ZONE_MOVABLE],
+            "nr_zspages", &movable_nr_zspages))
+        goto err;
+    pthread_mutex_unlock(&fileread_buffer_mutex);
+
+    return movable_nr_zspages;
+err:
+    LOG(ERROR) << "failed to get Movable zspage_nr";
+    pthread_mutex_unlock(&fileread_buffer_mutex);
+
+    return -EINVAL;
+}
+
+static inline uint64_t ceil_div_u64(uint64_t num, uint64_t den)
+{
+    return den ? (num + den - 1) / den : 0;
+}
+
+/*
+ * number of blocks in Movable zone required to be plugged-in so that
+ * zram pages will not be migrated out to Normal zone during unplug.
+*/
+static int64_t get_num_blocks_zram()
+{
+    uint64_t num_blocks;
+    uint64_t total_bytes;
+    int64_t nr_zspages;
+
+    nr_zspages = get_movable_zspage_nr();
+    if (nr_zspages <= 0)
+        return nr_zspages;
+
+    total_bytes = nr_zspages * (uint64_t)sys_page_size;
+    num_blocks = ceil_div_u64(total_bytes, (uint64_t)resolution * SIZE_1MB);
+
+    return num_blocks;
+}
+
+static uint64_t get_num_blocks_persistent()
+{
+    uint64_t min_blocks_persistent;
+    int64_t num_blocks_zram;
+
+    /* get min number of blocks required to host zram pages in Movable zone */
+    num_blocks_zram = get_num_blocks_zram();
+
+    min_blocks_persistent = ceil_div_u64((uint64_t)MIN_MOVABLE_SIZE_PERSISTENT_MB, resolution);
+
+    /* adjust min_blocks_persistent to account for zram pages present */
+    if (num_blocks_zram > 0)
+        min_blocks_persistent = std::max((uint64_t)num_blocks_zram, min_blocks_persistent);
+
+    return min_blocks_persistent;
+}
+
+static uint64_t adjust_count_to_remove(uint64_t count_to_remove)
+{
+    uint64_t max_removable, min_blocks_persistent;
+    size_t total_blocks_plugged = 0;
+
+    min_blocks_persistent = get_num_blocks_persistent();
+
+    if(get_total_block_plugin_count(&total_blocks_plugged))
+        return 0;
+
+    /* keep atleast required number of blocks to be persistent */
+    if (total_blocks_plugged <= min_blocks_persistent)
+        return 0;
+
+    max_removable = total_blocks_plugged - min_blocks_persistent;
+
+    return (count_to_remove < max_removable)
+               ? count_to_remove
+               : max_removable;
+}
+
+static inline int new_pressure_event_received()
+{
+    if (get_atomic_variable_bool(cancel_check)) {
+        set_atomic_variable_bool(cancel_check, false);
+        set_atomic_variable_bool(wait_in_progress, false);
+        return 1;
+    }
+
+    return 0;
 }
 
 static inline uint64_t get_movable_pgalloc_nr()
@@ -818,7 +933,7 @@ void* memtrack_thread_function(void *arg) {
     uint64_t count = 0, mem_chunks_unplugged = 0, total_free = 0;
     uint64_t kernel_count = 0, kernel_chunks_plugged = 0;
     struct memory_snapshot mem_snap;
-    int res, retry_count = 0;
+    int res, retry_count;
     unsigned int wake_locked = 0;
 
     while (1) {
@@ -826,27 +941,28 @@ void* memtrack_thread_function(void *arg) {
         /* lets wait for notify */
         wait_for_condition_timed(&thread_execution_cond,
                 &thread_execution_mutex, NULL);
+        retry_count = 0;
 
 startover:
         mem_chunks_unplugged = 0;
         clock_gettime(CLOCK_MONOTONIC, &timeout);
-        timeout.tv_sec += IDLE_WAIT_TIME_S;
+        if (!retry_count)
+            timeout.tv_sec += IDLE_WAIT_TIME_S;
+        else
+            timeout.tv_sec += RETRY_WAIT_TIME_S;
 
         set_atomic_variable_bool(wait_in_progress, true);
 
-        /* wait for IDLE_WAIT_TIME_S seconds of idle in memory pressure */
+        /* wait few seconds of idle in memory pressure */
         wait_for_condition_timed(&thread_execution_cond,
                 &thread_execution_mutex, &timeout);
 
         /* check if we received any new memory pressure event during idle time wait */
-        if (get_atomic_variable_bool(cancel_check)) {
-            set_atomic_variable_bool(cancel_check, false);
-            set_atomic_variable_bool(wait_in_progress, false);
+        if (new_pressure_event_received())
             goto startover;
-        }
 
         /*
-         * we have passed the IDLE_WAIT_TIME_S seconds of idle in memory pressure.
+         * we have passed beyond some time of idle memory pressure.
          * its safe now to assume that no memory consuming usescases are running.
          */
 
@@ -855,11 +971,8 @@ startover:
             wait_until_pressure_decay();
 
         /* check if we received any new memory pressure event during pressure decay wait */
-        if (get_atomic_variable_bool(cancel_check)) {
-            set_atomic_variable_bool(cancel_check, false);
-            set_atomic_variable_bool(wait_in_progress, false);
+        if (new_pressure_event_received())
             goto startover;
-        }
 
         /* didn't receive any new memory pressure events, so time to release memory to PVM */
         //TODO: add more checks for memory stats such as reclaimable memory, zram etc.
@@ -871,25 +984,23 @@ startover:
 
         LOG(INFO) << "MemFree before UNPLUG: " << mem_snap.sys_memfree_kb <<
                 " KB (Normal: " << mem_snap.normal_free_kb << " KB, Movable: " <<
-                mem_snap.movable_free_kb << " KB)";
+                mem_snap.movable_free_kb << " KB, swap_free_kb: " << mem_snap.swap_free_kb << " KB)";
 
         LOG(INFO) << "Movable inactive_file: " << mem_snap.movable_inactive_file_kb <<
                         " KB : inactive_anon: " << mem_snap.movable_inactive_anon_kb << " KB";
 
         count = (total_free / SIZE_1KB) / resolution;
 
-        LOG(DEBUG) << "Count " << count << " mem_chunks_plugged " <<
-                mem_chunks_plugged.load() << " resolution " << resolution <<
-                " MB plugged_memory " << plugged_memory.load() << " MB";
-
         if (!wake_locked && wake_lock_acquire())
             wake_locked = 1;
-	/*
-	 * Increasing threshold for free/reclaimable pages by one memory chunk.
-	 * More details are captured in commit log.
-	 */
-	if (count <= 1)
-		goto wake_unlock;
+
+        /* update count to unplug based on minimum blocks system needs to have */
+        count = adjust_count_to_remove(count);
+
+        LOG(INFO) << "count_to_remove: " << count << " mem_chunks_plugged: " <<
+                mem_chunks_plugged.load() << " resolution: " << resolution <<
+                " MB plugged_memory: " << plugged_memory.load() << " MB";
+
         /* first release blocks added by kernel */
         if (get_kernel_plugin_count(&kernel_chunks_plugged) < 0) {
             LOG(ERROR) << "failed to get kernel plugin count";
@@ -898,6 +1009,8 @@ startover:
         LOG(INFO) << "kernel_chunks_plugged: " << kernel_chunks_plugged;
 
         kernel_count = std::min(count, kernel_chunks_plugged);
+
+        /*** unplug memory blocks added by kernel ***/
         memory_unplug_request_kernel(kernel_count);
 
         /* get kernel plugin count after write */
@@ -911,9 +1024,11 @@ startover:
             count -= (kernel_chunks_plugged - kernel_count);
 
 release_blocks:
+        /*** unplug memory blocks added by psi-daemon service ***/
         count = std::min(count, mem_chunks_plugged.load());
         LOG(INFO) << "Count after kernel unplug: " << count;
 
+        /*     *** unplugging ***     */
         while(count-- > 0) {
             res = memory_unplug_request(resolution);
             if (res) {
@@ -930,7 +1045,7 @@ release_blocks:
         if (mem_chunks_unplugged)
             LOG(INFO) << "Unplugged " << mem_chunks_unplugged <<
                 " memory chunks. Total memory unplugged: " <<
-                mem_chunks_unplugged << " MB";
+                mem_chunks_unplugged * resolution << " MB";
         plugged_memory -= (resolution * mem_chunks_unplugged);
         mem_chunks_plugged -= mem_chunks_unplugged;
 
@@ -946,23 +1061,30 @@ release_blocks:
                 mem_snap.movable_free_kb<< " KB)";
 
 retry:
-        if (!mem_chunks_unplugged && mem_chunks_plugged && retry_count < MAX_UNPLUG_RETRY) {
+        if(get_total_block_plugin_count(&count))
+            count = mem_chunks_plugged.load();
+
+        /* if there are still blocks being plugged-in, retry and startover */
+        if (count > get_num_blocks_persistent() && retry_count < MAX_UNPLUG_RETRY) {
             ++retry_count;
-            LOG(INFO) << "Retrying unplug after " << IDLE_WAIT_TIME_S <<
+            LOG(INFO) << "Retrying unplug after " << RETRY_WAIT_TIME_S <<
                     " seconds (retry attempt: " << retry_count << ")";
             goto startover;
         }
         else {
-	    if (!total_free)
-		LOG(INFO) << "No free memory left to unplug";
+            if (!total_free)
+                LOG(INFO) << "No free memory left to unplug";
+
             if (retry_count == MAX_UNPLUG_RETRY)
                 LOG(INFO) << "Max retry attempt reached for unplugging!!";
-            if (!mem_chunks_plugged)
+
+            if(get_total_block_plugin_count(&count))
+                count = mem_chunks_plugged.load();
+            if (count == 0)
                 LOG(INFO) << "Unplugged all memory!!";
             retry_count = 0;
         }
 
-wake_unlock:
         //TODO: should we keep checking until all plugged memory is unplugged? goto startover ?
         if(wake_locked && !wake_unlock())
             LOG (ERROR) << "failed to wake unlock";
