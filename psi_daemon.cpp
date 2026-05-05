@@ -24,7 +24,7 @@
 #include <pthread.h>
 #include <base/logging.h>
 #include <atomic>
-#include <sys/mman.h>
+#include <signal.h>
 
 #ifndef __weak
 #define __weak __attribute__((weak))
@@ -81,6 +81,7 @@ static const char* const zone_names[ZONE_MAX] = {
 
 #define MEMINFO_PATH    "/proc/meminfo"
 #define ZONEINFO_PATH   "/proc/zoneinfo"
+#define VMSTAT_PATH     "/proc/vmstat"
 #define PSI_MEMORY_PATH "/proc/pressure/memory"
 
 #define WAKE_LOCK_PATH   "/sys/power/wake_lock"
@@ -116,6 +117,8 @@ struct memory_snapshot {
     uint64_t movable_free_kb;
     uint64_t movable_inactive_anon_kb;
     uint64_t movable_inactive_file_kb;
+    uint64_t pgalloc_normal_nr;
+    uint64_t pgalloc_movable_nr;
     uint64_t swap_free_kb;
 };
 
@@ -166,6 +169,11 @@ int32_t event_fds[PRESSURE_EVT_COUNT];
 /* fd for main epoll_wait */
 int32_t psi_epollfd = -1;
 
+struct timespec last_remove_time;
+
+/* disallow memblock addition witin 2s after the last memblock remove (window) */
+static const uint32_t HOLD_OFF_AFTER_REMOVE_MS = 2000;
+
 #define EXP_1S_10S      0.9048F     /* 1/exp(1s/10s) */
 #define EXP_1S_60S      0.9834F     /* 1/exp(1s/60s) */
 #define EXP_1S_300S     0.9966F     /* 1/exp(1s/300s) */
@@ -177,8 +185,19 @@ static pthread_condattr_t thread_execution_cond_attr;
 std::atomic<bool> cancel_check(false);
 std::atomic<bool> wait_in_progress(false);
 
+/* minimal increase in nr_pgalloc pages, which can be considered as allocation activity */
+#define PGALLOC_GROWTH_THRESHOLD      1000
+
+/* nr_pfalloc of Movable zone after last unplug of a block */
+uint64_t movable_pgalloc_last_unplug;
+
 /* default wait time for pressure to be idle (in seconds) */
-#define IDLE_WAIT_TIME_S    10
+#define IDLE_WAIT_TIME_S    3
+
+/* The retry timer is for retrying unplug procedure if there are still
+ * blocks present after the current unplug procedure.
+ * */
+#define RETRY_WAIT_TIME_S   1
 
 /* stall tracking window size, 50ms*/
 static int PSI_WINDOW_SIZE_US = (50 * US_PER_MS);
@@ -332,6 +351,11 @@ static char *get_meminfo(void)
     return read_file(MEMINFO_PATH);
 }
 
+static char *get_vmstat(void)
+{
+    return read_file(VMSTAT_PATH);
+}
+
 static int parse_zone_field(char *buf, const char *zone_name,
         const char *field_name, uint64_t *val)
 {
@@ -360,6 +384,9 @@ static int system_memory_snapshot(struct memory_snapshot *mem_snap)
     int res = -1;
 
     pthread_mutex_lock(&fileread_buffer_mutex);
+
+    /***** get zoneinfo *****/
+
     buf = get_zoneinfo();
     if (!buf)
         goto err;
@@ -390,6 +417,8 @@ static int system_memory_snapshot(struct memory_snapshot *mem_snap)
         mem_snap->movable_inactive_file_kb = 0;
     mem_snap->movable_inactive_file_kb *= sys_page_size / SIZE_1KB;
 
+    /***** get meminfo *****/
+
     buf = get_meminfo();
     if (!buf)
         goto err;
@@ -398,6 +427,18 @@ static int system_memory_snapshot(struct memory_snapshot *mem_snap)
         goto err;
     if(parse_field(buf, "SwapFree", &mem_snap->swap_free_kb))
 	    goto err;
+
+    /***** get vmstat *****/
+
+    buf = get_vmstat();
+    if (!buf)
+        goto err;
+
+    if(parse_field(buf, "pgalloc_normal", &mem_snap->pgalloc_normal_nr))
+        goto err;
+    if(parse_field(buf, "pgalloc_movable", &mem_snap->pgalloc_movable_nr))
+        goto err;
+
     res = 0;
 
 err:
@@ -741,6 +782,51 @@ static uint64_t get_memsnap_and_total_free(struct memory_snapshot *mem_snap)
     return free;
 }
 
+static inline int new_pressure_event_received()
+{
+    if (get_atomic_variable_bool(cancel_check)) {
+        set_atomic_variable_bool(cancel_check, false);
+        set_atomic_variable_bool(wait_in_progress, false);
+        return 1;
+    }
+
+    return 0;
+}
+
+static inline uint64_t get_movable_pgalloc_nr()
+{
+    char *buf;
+    uint64_t pgalloc_movable_nr;
+
+    pthread_mutex_lock(&fileread_buffer_mutex);
+    buf = get_vmstat();
+    if (!buf)
+        goto err;
+
+    if(parse_field(buf, "pgalloc_movable", &pgalloc_movable_nr))
+        goto err;
+
+    pthread_mutex_unlock(&fileread_buffer_mutex);
+    return pgalloc_movable_nr;
+
+err:
+    LOG(ERROR) << "failed to get memory snapshot";
+    pthread_mutex_unlock(&fileread_buffer_mutex);
+    return 0;
+}
+
+/* Returns 1 if pgalloc_new > pgalloc_old by more than PGALLOC_GROWTH_THRESHOLD */
+static inline int system_allocation_activity(uint64_t pgalloc_old, uint64_t pgalloc_new)
+{
+    if (pgalloc_old == 0)
+        return 0;
+
+    if (pgalloc_new <= pgalloc_old)
+        return 0;
+
+    return ((pgalloc_new - pgalloc_old) >= PGALLOC_GROWTH_THRESHOLD) ? 1 : 0;
+}
+
 void* memtrack_thread_function(void *arg) {
 
     (void)(arg);
@@ -748,7 +834,7 @@ void* memtrack_thread_function(void *arg) {
     uint64_t count = 0, mem_chunks_unplugged = 0, total_free = 0;
     uint64_t kernel_count = 0, kernel_chunks_plugged = 0;
     struct memory_snapshot mem_snap;
-    int res, retry_count = 0;
+    int res, retry_count;
     unsigned int wake_locked = 0;
 
     while (1) {
@@ -756,27 +842,28 @@ void* memtrack_thread_function(void *arg) {
         /* lets wait for notify */
         wait_for_condition_timed(&thread_execution_cond,
                 &thread_execution_mutex, NULL);
+        retry_count = 0;
 
 startover:
         mem_chunks_unplugged = 0;
         clock_gettime(CLOCK_MONOTONIC, &timeout);
-        timeout.tv_sec += IDLE_WAIT_TIME_S;
+        if (!retry_count)
+            timeout.tv_sec += IDLE_WAIT_TIME_S;
+        else
+            timeout.tv_sec += RETRY_WAIT_TIME_S;
 
         set_atomic_variable_bool(wait_in_progress, true);
 
-        /* wait for IDLE_WAIT_TIME_S seconds of idle in memory pressure */
+        /* wait few seconds of idle in memory pressure */
         wait_for_condition_timed(&thread_execution_cond,
                 &thread_execution_mutex, &timeout);
 
         /* check if we received any new memory pressure event during idle time wait */
-        if (get_atomic_variable_bool(cancel_check)) {
-            set_atomic_variable_bool(cancel_check, false);
-            set_atomic_variable_bool(wait_in_progress, false);
+        if (new_pressure_event_received())
             goto startover;
-        }
 
         /*
-         * we have passed the IDLE_WAIT_TIME_S seconds of idle in memory pressure.
+         * we have passed beyond some time of idle memory pressure.
          * its safe now to assume that no memory consuming usescases are running.
          */
 
@@ -785,11 +872,8 @@ startover:
             wait_until_pressure_decay();
 
         /* check if we received any new memory pressure event during pressure decay wait */
-        if (get_atomic_variable_bool(cancel_check)) {
-            set_atomic_variable_bool(cancel_check, false);
-            set_atomic_variable_bool(wait_in_progress, false);
+        if (new_pressure_event_received())
             goto startover;
-        }
 
         /* didn't receive any new memory pressure events, so time to release memory to PVM */
         //TODO: add more checks for memory stats such as reclaimable memory, zram etc.
@@ -801,7 +885,7 @@ startover:
 
         LOG(INFO) << "MemFree before UNPLUG: " << mem_snap.sys_memfree_kb <<
                 " KB (Normal: " << mem_snap.normal_free_kb << " KB, Movable: " <<
-                mem_snap.movable_free_kb << " KB)";
+                mem_snap.movable_free_kb << " KB, swap_free_kb: " << mem_snap.swap_free_kb << " KB)";
 
         LOG(INFO) << "Movable inactive_file: " << mem_snap.movable_inactive_file_kb <<
                         " KB : inactive_anon: " << mem_snap.movable_inactive_anon_kb << " KB";
@@ -814,12 +898,7 @@ startover:
 
         if (!wake_locked && wake_lock_acquire())
             wake_locked = 1;
-	/*
-	 * Increasing threshold for free/reclaimable pages by one memory chunk.
-	 * More details are captured in commit log.
-	 */
-	if (count <= 1)
-		goto wake_unlock;
+
         /* first release blocks added by kernel */
         if (get_kernel_plugin_count(&kernel_chunks_plugged) < 0) {
             LOG(ERROR) << "failed to get kernel plugin count";
@@ -844,6 +923,8 @@ release_blocks:
         count = std::min(count, mem_chunks_plugged.load());
         LOG(INFO) << "Count after kernel unplug: " << count;
 
+        /*     *** unplugging ***     */
+
         while(count-- > 0) {
             res = memory_unplug_request(resolution);
             if (res) {
@@ -851,15 +932,21 @@ release_blocks:
                         resolution << "MB";
                 continue;
             }
+            /* update remove holdoff window */
+            clock_gettime(CLOCK_MONOTONIC, &last_remove_time);
+            movable_pgalloc_last_unplug = get_movable_pgalloc_nr();
             mem_chunks_unplugged++;
         }
 
         if (mem_chunks_unplugged)
             LOG(INFO) << "Unplugged " << mem_chunks_unplugged <<
                 " memory chunks. Total memory unplugged: " <<
-                mem_chunks_unplugged << " MB";
+                mem_chunks_unplugged * resolution << " MB";
         plugged_memory -= (resolution * mem_chunks_unplugged);
         mem_chunks_plugged -= mem_chunks_unplugged;
+
+        /* update remove holdoff window */
+        clock_gettime(CLOCK_MONOTONIC, &last_remove_time);
 
         /* take memory snapshot after unplugging */
         if (system_memory_snapshot(&mem_snap))
@@ -870,15 +957,16 @@ release_blocks:
                 mem_snap.movable_free_kb<< " KB)";
 
 retry:
-        if (!mem_chunks_unplugged && mem_chunks_plugged && retry_count < MAX_UNPLUG_RETRY) {
+        /* if there are still blocks being plugged-in, retry and startover */
+        if (mem_chunks_plugged && retry_count < MAX_UNPLUG_RETRY) {
             ++retry_count;
-            LOG(INFO) << "Retrying unplug after " << IDLE_WAIT_TIME_S <<
+            LOG(INFO) << "Retrying unplug after " << RETRY_WAIT_TIME_S <<
                     " seconds (retry attempt: " << retry_count << ")";
             goto startover;
         }
         else {
-	    if (!total_free)
-		LOG(INFO) << "No free memory left to unplug";
+            if (!total_free)
+                LOG(INFO) << "No free memory left to unplug";
             if (retry_count == MAX_UNPLUG_RETRY)
                 LOG(INFO) << "Max retry attempt reached for unplugging!!";
             if (!mem_chunks_plugged)
@@ -886,7 +974,6 @@ retry:
             retry_count = 0;
         }
 
-wake_unlock:
         //TODO: should we keep checking until all plugged memory is unplugged? goto startover ?
         if(wake_locked && !wake_unlock())
             LOG (ERROR) << "failed to wake unlock";
@@ -959,6 +1046,35 @@ static uint64_t get_timespec_delta_us(struct timespec start_tv, struct timespec 
     return (end_us - start_us);
 }
 
+static int64_t timespec_diff_ms(const struct timespec *a,
+                                const struct timespec *b)
+{
+    int64_t sec_diff  = (int64_t)a->tv_sec - (int64_t)b->tv_sec;
+    int64_t nsec_diff = (int64_t)a->tv_nsec - (int64_t)b->tv_nsec;
+
+    return sec_diff * 1000 + nsec_diff / 1000000;
+}
+
+static inline bool within_remove_holdoff()
+{
+	struct timespec current;
+	int64_t elapsed_ms;
+
+    if (last_remove_time.tv_sec == 0 && last_remove_time.tv_nsec == 0) {
+        // No prior remove; not within hold-off.
+        return false;
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &current);
+    elapsed_ms = timespec_diff_ms(&current, &last_remove_time);
+
+    /* negative elapsed means clocks not monotonic */
+    if (elapsed_ms < 0)
+        return false;
+
+    return (uint64_t)elapsed_ms < (uint64_t)HOLD_OFF_AFTER_REMOVE_MS;
+}
+
 static void psi_mainloop(void) {
     pressure_levels pressure_level = PRESSURE_NONE;
     struct timespec cur, start, end;
@@ -1004,6 +1120,28 @@ static void psi_mainloop(void) {
         if ((pressure_level >= PRESSURE_EVT_5) &&        /* min threshold reached */
             (plugged_memory.load() < (uint64_t)max_plugged_memory) &&    /* max memory boundary */
             (mem_snap.movable_free_kb < ((uint64_t)resolution * SIZE_1KB) / 2)) {    /* only if movable < 1/2 * resolution */
+
+            /*
+             * if we recently had a memblock remove, we would expect PSI pressure
+             * to increase due to kernel doing migration, compaction, update zone
+             * watermarks, takes required locks etc., which leads to temporary stalling
+             * of processes leading to PSI events (PSI_SOME) being fired. This would
+             * lead us here trying to plug a block again. This leads to "ping-pong"
+             * effect of memory blocks being removed-added-removed again later.
+             *
+             * One reliable way to check for natural pressure vs PSI due to unplug
+             * is to check for growth in pgalloc_movable allocations and having
+             * a hold-off window after unplug to temporarily ignore PSI events
+             * occuring due to unplug. If still within hold-off period and pgalloc_movable
+             * has increased significantly, then its considered as PSI pressure due
+             * to movable allocation activity, and we go ahead and plug-in memory block
+             * irrespective of if we witin the remove holdoff period.
+             */
+            if (within_remove_holdoff() &&
+                    !system_allocation_activity(movable_pgalloc_last_unplug, get_movable_pgalloc_nr())) {
+                LOG(INFO) <<"PSI pressure within Remove Holdoff period. IGNORING PRESSURE EVEVNT...";
+                continue;
+            }
 
             LOG(DEBUG) << "Plugging-in " << resolution << "MB of memory";
 
@@ -1064,14 +1202,57 @@ void set_oom_score_adj_self(int adj)
     close(fd);
 }
 
+static void notify_wakeup(void) {
+    /* notify memtrack thread that we received new SIGUSR1 event to wakeup */
+    LOG (INFO) << "Sending signal to memtrack thread to wakeup.";
+    pthread_cond_signal(&thread_execution_cond);
+}
+
+void* signal_thread(void* arg) {
+
+    (void)arg;
+    int sig, ret;
+    sigset_t signal;
+
+    sigemptyset(&signal);
+    sigaddset(&signal, SIGUSR1);
+
+    /* ensure SIGUSR1 is blocked in this thread too (should already be via main) */
+    pthread_sigmask(SIG_BLOCK, &signal, NULL);
+
+    for (;;) {
+
+        /* wait for SIGUSR1 signal. blocks until SIGUSR1 is pending */
+        ret = sigwait(&signal, &sig);
+
+        if (ret == 0 && sig == SIGUSR1) {
+            LOG(INFO) << "Received SIGUSR1 event";
+            /* notify reclaim thread to wakeup */
+            notify_wakeup();
+        }
+    }
+
+    return NULL;
+}
+
 int main(void) {
 
     int i;
-    pthread_t memtrack_thread;
+    pthread_t memtrack_thread, sigusr1_thread;
     std::string thresholds;
     char str[LINE_MAX];
     struct memory_snapshot mem_snap;
     size_t kernel_count;
+    sigset_t signal;
+
+    sigemptyset(&signal);
+    sigaddset(&signal, SIGUSR1);
+
+    /* Block SIGUSR1 in the main thread before creating any threads. */
+    if (pthread_sigmask(SIG_BLOCK, &signal, NULL) != 0) {
+        LOG(ERROR) << "pthread_sigmask failed";
+        return -EINVAL;
+    }
 
     /* get system PAGE_SIZE */
     sys_page_size = sysconf(_SC_PAGE_SIZE);
@@ -1080,9 +1261,6 @@ int main(void) {
         return -EINVAL;
     }
 
-    if (mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT) && (errno != EINVAL)) {
-	    LOG(ERROR) << "mlock failed!! System can't behave as expected";
-    }
     readfile_buf_size = sys_page_size;
 
     /* allocate buffer for file reads */
@@ -1114,6 +1292,12 @@ int main(void) {
     /* create pthread for downword memory pressure tracking */
     if (pthread_create(&memtrack_thread, NULL, &memtrack_thread_function, NULL)) {
         LOG(ERROR) << "Error creating pthread for downward mem tracking";
+        return -EINVAL;
+    }
+
+    /* create pthread for listening to SIGUSR1 events from userspace */
+    if (pthread_create(&sigusr1_thread, NULL, &signal_thread, NULL)) {
+        LOG(ERROR) << "Error creating pthread for SIGUSR1 event tracking";
         return -EINVAL;
     }
 
