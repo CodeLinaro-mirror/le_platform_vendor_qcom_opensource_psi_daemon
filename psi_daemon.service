@@ -18,6 +18,8 @@ ExecStartPre=+/bin/chmod 0664 /proc/pressure/memory
 ExecStartPre=+/bin/chown system:system /proc/pressure/memory
 ExecStartPre=+/bin/chmod 0222 /sys/devices/virtual/qti_virtio_mem/qti_virtio_mem/kernel_unplug
 ExecStartPre=+/bin/chown system:system /sys/devices/virtual/qti_virtio_mem/qti_virtio_mem/kernel_unplug
+#relax lowmem_reserve to allow Movable fallback into Normal zone
+ExecStartPre=+/bin/sh -c "echo 32 32 32 > /proc/sys/vm/lowmem_reserve_ratio"
 SupplementaryGroups=wakelock
 ExecStart=/usr/bin/psi_daemon
 CapabilityBoundingSet=CAP_SYS_RESOURCE CAP_BLOCK_SUSPEND
