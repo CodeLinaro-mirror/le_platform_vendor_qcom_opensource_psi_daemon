@@ -1447,6 +1447,41 @@ static void notify_wakeup(void) {
     pthread_cond_signal(&thread_execution_cond);
 }
 
+/*
+ * Seconds to wait after psi_daemon starts before firing the boot-settle
+ * unplug cycle.  Boot PSI storms typically last 5-10s; 30s gives the
+ * system enough time to fully settle before we attempt reclaim.
+ */
+#define BOOT_SETTLE_WAIT_S  10
+
+/*
+ * boot_settle_thread — fires one guaranteed unplug cycle after boot.
+ *
+ * Problem: after the boot PSI storm, the system may go quiet with no
+ * further PSI events.  memtrack_thread_function only wakes on
+ * pthread_cond_signal from psi_mainloop, so if no PSI event arrives
+ * after boot the plugged blocks are never reclaimed — until an external
+ * wakeup (user login, adb) happens to resume the system.
+ *
+ * Fix: sleep BOOT_SETTLE_WAIT_S seconds then send one cond_signal to
+ * guarantee memtrack runs at least once after boot has settled.
+ * After that this thread exits — it is a one-shot.
+ */
+void* boot_settle_thread(void* arg) {
+    (void)arg;
+
+    LOG(INFO) << "boot_settle_thread: waiting " << BOOT_SETTLE_WAIT_S
+              << "s for system to settle after boot...";
+
+    sleep(BOOT_SETTLE_WAIT_S);
+
+    LOG(INFO) << "boot_settle_thread: boot settle wait done, "
+                 "triggering initial unplug cycle.";
+    pthread_cond_signal(&thread_execution_cond);
+
+    return NULL;
+}
+
 void* signal_thread(void* arg) {
 
     (void)arg;
@@ -1477,7 +1512,7 @@ void* signal_thread(void* arg) {
 int main(void) {
 
     int i;
-    pthread_t memtrack_thread, sigusr1_thread;
+    pthread_t memtrack_thread, sigusr1_thread, boot_settle_thread_id;
     std::string thresholds;
     char str[LINE_MAX];
     struct memory_snapshot mem_snap;
@@ -1538,6 +1573,13 @@ int main(void) {
     if (pthread_create(&sigusr1_thread, NULL, &signal_thread, NULL)) {
         LOG(ERROR) << "Error creating pthread for SIGUSR1 event tracking";
         return -EINVAL;
+    }
+
+    /* create one-shot thread to trigger unplug after boot settles */
+    if (pthread_create(&boot_settle_thread_id, NULL, &boot_settle_thread, NULL)) {
+        LOG(ERROR) << "Error creating boot_settle_thread — boot-time unplug may not run";
+    } else {
+        pthread_detach(boot_settle_thread_id);
     }
 
     pthread_condattr_destroy(&thread_execution_cond_attr);
