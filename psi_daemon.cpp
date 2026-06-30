@@ -93,7 +93,7 @@ static const char* const zone_names[ZONE_MAX] = {
 #define DEFAULT_PLUGIN_RESOLUTION_MB    (4)
 #define DEFAULT_MAX_MEMORY_PLUGIN_MB    (256)
 
-#define MAX_UNPLUG_RETRY                (2)
+#define MAX_UNPLUG_RETRY                (10)
 
 enum psi_stall_type {
     PSI_SOME,
@@ -171,8 +171,12 @@ int32_t psi_epollfd = -1;
 
 struct timespec last_remove_time;
 
-/* disallow memblock addition witin 2s after the last memblock remove (window) */
-static const uint32_t HOLD_OFF_AFTER_REMOVE_MS = 2000;
+/*
+ * Hold-off window after a memblock remove.  Scaled dynamically by
+ * get_holdoff_ms_after_remove() based on how many blocks were removed;
+ * this variable tracks the value used for the most recent removal.
+ */
+static uint32_t last_remove_holdoff_ms = 2000;
 
 #define EXP_1S_10S      0.9048F     /* 1/exp(1s/10s) */
 #define EXP_1S_60S      0.9834F     /* 1/exp(1s/60s) */
@@ -192,7 +196,21 @@ std::atomic<bool> wait_in_progress(false);
 uint64_t movable_pgalloc_last_unplug;
 
 /* default wait time for pressure to be idle (in seconds) */
-#define IDLE_WAIT_TIME_S    3
+/*
+ * Base idle wait before attempting unplug.  The actual wait is computed
+ * adaptively by get_idle_wait_time_s() based on how many blocks are
+ * currently plugged: a heavier usecase plugs more blocks and warrants a
+ * longer observation window before we conclude it has ended.
+ */
+#define IDLE_WAIT_TIME_S_BASE  3
+#define IDLE_WAIT_TIME_S_MED   8
+#define IDLE_WAIT_TIME_S_HEAVY 15
+
+/* Maximum blocks to unplug in a single cycle to avoid large sudden drops */
+#define MAX_BLOCKS_PER_UNPLUG_CYCLE  5
+
+/* Settling time between consecutive single-block removals (seconds) */
+#define UNPLUG_SETTLE_TIME_S    1
 
 /* The retry timer is for retrying unplug procedure if there are still
  * blocks present after the current unplug procedure.
@@ -930,6 +948,31 @@ static inline int system_allocation_activity(uint64_t pgalloc_old, uint64_t pgal
     return ((pgalloc_new - pgalloc_old) >= PGALLOC_GROWTH_THRESHOLD) ? 1 : 0;
 }
 
+/*
+ * Adaptive idle wait: more blocks plugged means a heavier usecase is
+ * running; wait longer before concluding it has ended.
+ */
+static uint64_t get_idle_wait_time_s()
+{
+    uint64_t chunks = mem_chunks_plugged.load();
+    if (chunks >= 10) return IDLE_WAIT_TIME_S_HEAVY;
+    if (chunks >= 5)  return IDLE_WAIT_TIME_S_MED;
+    return IDLE_WAIT_TIME_S_BASE;
+}
+
+/*
+ * Scale the post-removal hold-off window with the number of blocks
+ * removed.  Each removal triggers kernel page migration, compaction and
+ * zone-watermark updates that cause transient PSI stalls.  A larger
+ * removal batch produces a longer stall storm.
+ * Base: 3 s + 500 ms per block, capped at 8 s.
+ */
+static uint32_t get_holdoff_ms_after_remove(uint64_t blocks_removed)
+{
+    uint32_t ms = 3000 + (uint32_t)(blocks_removed * 500);
+    return std::min(ms, (uint32_t)8000);
+}
+
 void* memtrack_thread_function(void *arg) {
 
     (void)(arg);
@@ -951,7 +994,7 @@ startover:
         mem_chunks_unplugged = 0;
         clock_gettime(CLOCK_MONOTONIC, &timeout);
         if (!retry_count)
-            timeout.tv_sec += IDLE_WAIT_TIME_S;
+            timeout.tv_sec += (time_t)get_idle_wait_time_s();
         else
             timeout.tv_sec += RETRY_WAIT_TIME_S;
 
@@ -979,7 +1022,6 @@ startover:
             goto startover;
 
         /* didn't receive any new memory pressure events, so time to release memory to PVM */
-        //TODO: add more checks for memory stats such as reclaimable memory, zram etc.
 
         /* take snapshot of memory */
         total_free = get_memsnap_and_total_free(&mem_snap);
@@ -995,11 +1037,33 @@ startover:
 
         count = (total_free / SIZE_1KB) / resolution;
 
+        /*
+         * Integer floor division can zero out count even when there is a
+         * meaningful reclaimable budget.  Example: total_free=1612 KB with
+         * resolution=2048 KB gives count=0, yet 1 block is safely removable.
+         * If the budget covers at least half a block (resolution/2 KB) and
+         * there are blocks above the persistent floor, allow removing 1 block.
+         * This prevents psi_daemon from getting permanently stuck at the
+         * persistent floor + 1 block after boot or after a usecase ends.
+         */
+        if (count == 0 && total_free >= (resolution * SIZE_1KB / 2)) {
+            uint64_t adj = adjust_count_to_remove(1);
+            if (adj > 0) {
+                count = 1;
+                LOG(INFO) << "Partial budget (" << total_free / SIZE_1KB
+                          << " KB < " << resolution << " MB): allowing 1 block unplug";
+            }
+        }
+
         if (!wake_locked && wake_lock_acquire())
             wake_locked = 1;
 
         /* update count to unplug based on minimum blocks system needs to have */
         count = adjust_count_to_remove(count);
+
+        /* cap per-cycle removal to avoid large sudden memory drops that
+         * trigger an immediate PSI storm and re-plugging */
+        count = std::min(count, (uint64_t)MAX_BLOCKS_PER_UNPLUG_CYCLE);
 
         LOG(INFO) << "count_to_remove: " << count << " mem_chunks_plugged: " <<
                 mem_chunks_plugged.load() << " resolution: " << resolution <<
@@ -1032,29 +1096,71 @@ release_blocks:
         count = std::min(count, mem_chunks_plugged.load());
         LOG(INFO) << "Count after kernel unplug: " << count;
 
-        /*     *** unplugging ***     */
-        while(count-- > 0) {
-            res = memory_unplug_request(resolution);
-            if (res) {
-                LOG(ERROR) << "Failed to unplug one memory chunk of " <<
-                        resolution << "MB";
-                continue;
+        /*
+         * Unplug one block at a time.  After each removal wait a short
+         * settling period and re-evaluate whether more blocks should be
+         * removed.  This prevents large sudden drops that trigger an
+         * immediate PSI storm and re-plugging.
+         */
+        {
+            uint64_t max_to_remove = count;
+            while (max_to_remove-- > 0) {
+                /* abort if a new pressure event arrived */
+                if (new_pressure_event_received())
+                    goto startover;
+
+                res = memory_unplug_request(resolution);
+                if (res) {
+                    LOG(ERROR) << "Failed to unplug one memory chunk of "
+                               << resolution << "MB";
+                    continue;
+                }
+
+                clock_gettime(CLOCK_MONOTONIC, &last_remove_time);
+                last_remove_holdoff_ms = get_holdoff_ms_after_remove(1);
+                movable_pgalloc_last_unplug = get_movable_pgalloc_nr();
+                mem_chunks_unplugged++;
+                plugged_memory -= resolution;
+                mem_chunks_plugged--;
+
+                LOG(INFO) << "Unplugged 1 block (" << resolution
+                          << " MB). Total plugged: " << plugged_memory.load() << " MB";
+
+                if (max_to_remove == 0)
+                    break;
+
+                /*
+                 * No inter-block sleep needed: the holdoff window set by
+                 * last_remove_holdoff_ms already suppresses PSI events
+                 * caused by the removal in psi_mainloop.  Just check for
+                 * a new pressure event and continue immediately.
+                 */
+                if (new_pressure_event_received())
+                    goto startover;
+
+                /* re-evaluate: stop if memory is no longer surplus */
+                total_free = get_memsnap_and_total_free(&mem_snap);
+                if (!total_free)
+                    break;
+                uint64_t new_count = (total_free / SIZE_1KB) / resolution;
+                new_count = adjust_count_to_remove(new_count);
+                new_count = std::min(new_count, (uint64_t)MAX_BLOCKS_PER_UNPLUG_CYCLE);
+                if (new_count == 0) {
+                    LOG(INFO) << "Memory no longer surplus after removal, stopping";
+                    break;
+                }
+                max_to_remove = std::min(max_to_remove, new_count - 1);
             }
-            /* update remove holdoff window */
-            clock_gettime(CLOCK_MONOTONIC, &last_remove_time);
-            movable_pgalloc_last_unplug = get_movable_pgalloc_nr();
-            mem_chunks_unplugged++;
         }
 
-        if (mem_chunks_unplugged)
-            LOG(INFO) << "Unplugged " << mem_chunks_unplugged <<
-                " memory chunks. Total memory unplugged: " <<
-                mem_chunks_unplugged * resolution << " MB";
-        plugged_memory -= (resolution * mem_chunks_unplugged);
-        mem_chunks_plugged -= mem_chunks_unplugged;
-
-        /* update remove holdoff window */
-        clock_gettime(CLOCK_MONOTONIC, &last_remove_time);
+        if (mem_chunks_unplugged) {
+            LOG(INFO) << "Unplugged " << mem_chunks_unplugged
+                      << " memory chunks total. Total memory unplugged: "
+                      << mem_chunks_unplugged * resolution << " MB";
+            /* set holdoff scaled to total blocks removed this cycle */
+            clock_gettime(CLOCK_MONOTONIC, &last_remove_time);
+            last_remove_holdoff_ms = get_holdoff_ms_after_remove(mem_chunks_unplugged);
+        }
 
         /* take memory snapshot after unplugging */
         if (system_memory_snapshot(&mem_snap))
@@ -1071,9 +1177,22 @@ retry:
         /* if there are still blocks being plugged-in, retry and startover */
         if (count > get_num_blocks_persistent() && retry_count < MAX_UNPLUG_RETRY) {
             ++retry_count;
-            LOG(INFO) << "Retrying unplug after " << RETRY_WAIT_TIME_S <<
-                    " seconds (retry attempt: " << retry_count << ")";
-            goto startover;
+            /*
+             * Only retry if there is actually free memory to reclaim.
+             * If total_free is zero the budget formula already determined
+             * the system is too tight to remove any block — retrying will
+             * just spin MAX_UNPLUG_RETRY times doing nothing useful.
+             * Break out now and wait for the next PSI wakeup to re-evaluate.
+             */
+            if (!total_free) {
+                LOG(INFO) << "count_to_remove=0 and no free memory to reclaim. "
+                             "Stopping retries, waiting for next PSI event.";
+                retry_count = 0;
+            } else {
+                LOG(INFO) << "Retrying unplug after " << RETRY_WAIT_TIME_S <<
+                        " seconds (retry attempt: " << retry_count << ")";
+                goto startover;
+            }
         }
         else {
             if (!total_free)
@@ -1089,7 +1208,12 @@ retry:
             retry_count = 0;
         }
 
-        //TODO: should we keep checking until all plugged memory is unplugged? goto startover ?
+        /*
+         * Intentionally NOT doing goto startover here unconditionally.
+         * If total_free==0 the system is genuinely tight — no amount of
+         * retrying will free more blocks. The next PSI wakeup will
+         * re-trigger the cycle when conditions change.
+         */
         if(wake_locked && !wake_unlock())
             LOG (ERROR) << "failed to wake unlock";
         else
@@ -1187,7 +1311,7 @@ static inline bool within_remove_holdoff()
     if (elapsed_ms < 0)
         return false;
 
-    return (uint64_t)elapsed_ms < (uint64_t)HOLD_OFF_AFTER_REMOVE_MS;
+    return (uint64_t)elapsed_ms < (uint64_t)last_remove_holdoff_ms;
 }
 
 static void psi_mainloop(void) {
