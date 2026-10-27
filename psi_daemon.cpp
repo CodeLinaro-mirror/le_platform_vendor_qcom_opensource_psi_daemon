@@ -83,11 +83,12 @@ static const char* const zone_names[ZONE_MAX] = {
 #define ZONEINFO_PATH   "/proc/zoneinfo"
 #define VMSTAT_PATH     "/proc/vmstat"
 #define PSI_MEMORY_PATH "/proc/pressure/memory"
-
 #define WAKE_LOCK_PATH   "/sys/power/wake_lock"
 #define WAKE_UNLOCK_PATH "/sys/power/wake_unlock"
 #define WAKELOCK_STR     "psi_daemon_lock"
 #define WAKEUNLOCK_STR   WAKELOCK_STR
+
+#define ZONE_BALANCE_DT_PATH    "/proc/device-tree/soc/virtio_mem_device/qcom,qvm-zone-balance"
 
 /* memory plugin size defaults (in MBs)*/
 #define DEFAULT_PLUGIN_RESOLUTION_MB    (4)
@@ -801,9 +802,6 @@ static uint64_t get_memsnap_and_total_free(struct memory_snapshot *mem_snap)
     *
     * Discount inactive anon by a factor of 2 assuming a compression ratio
     * of 50% with zram.
-    *
-    * Free pages in the normal zone are ignored; lowmem_reserve is assumed
-    * to prohibit fallback from movable to normal zone.
     */
     free = mem_snap->movable_free_kb +
 	    mem_snap->movable_inactive_file_kb;
@@ -811,6 +809,10 @@ static uint64_t get_memsnap_and_total_free(struct memory_snapshot *mem_snap)
     free += std::min(mem_snap->swap_free_kb, mem_snap->movable_inactive_anon_kb) *
             ZRAM_COMPRESSION_RATIO_PCT / 100;
 
+    /*
+     * include  Normal free as well which can be used to host active pages
+     * from Movable zone for unplug.
+     */
     if (mem_snap->swap_free_kb && mem_snap->normal_free_kb > resolution * SIZE_1KB)
         free += (mem_snap->normal_free_kb);
 
@@ -845,6 +847,12 @@ static inline uint64_t ceil_div_u64(uint64_t num, uint64_t den)
     return den ? (num + den - 1) / den : 0;
 }
 
+/* Returns true if the qcom,qvm-zone-balance DT property node exists */
+static inline bool is_zone_balance_kernel_enabled()
+{
+    return (access(ZONE_BALANCE_DT_PATH, F_OK) == 0);
+}
+
 /*
  * number of blocks in Movable zone required to be plugged-in so that
  * zram pages will not be migrated out to Normal zone during unplug.
@@ -876,7 +884,7 @@ static uint64_t get_num_blocks_persistent()
     min_blocks_persistent = ceil_div_u64((uint64_t)MIN_MOVABLE_SIZE_PERSISTENT_MB, resolution);
 
     /* adjust min_blocks_persistent to account for zram pages present */
-    if (num_blocks_zram > 0)
+    if (num_blocks_zram > 0 && !is_zone_balance_kernel_enabled())
         min_blocks_persistent = std::max((uint64_t)num_blocks_zram, min_blocks_persistent);
 
     return min_blocks_persistent;
